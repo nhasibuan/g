@@ -73,7 +73,7 @@ The EA is structured as a **single-file component architecture** using classic O
 7. Tick volume ≥ multiplier × average (liquidity spike confirmed)
 8. Candle produces a directional signal (pattern + trend aligned)
 
-### Martingale Design (v10.10–v10.11)
+### Martingale Design (v10.10–v10.12)
 
 All re-entry decisions pass through a **single centralized decision gate** `CMartingaleController::ReentryAllowed()`, evaluated in order of cost:
 
@@ -88,7 +88,7 @@ All re-entry decisions pass through a **single centralized decision gate** `CMar
 7. **Decaying multiplier schedule** — Optional lot size decay (e.g., `"2.0,1.8,1.6,1.4,1.2"`) to reduce worst-case drawdown
 
 **Direction:**
-- Re-entries are always **reverse-direction** — each re-entry opens in the opposite direction of the prior (closed) position to exploit mean reversion. The former `SAME_DIRECTION` option has been removed.
+- Re-entries are always **reverse-direction** — each re-entry opens in the opposite direction of the prior (closed) position to exploit mean reversion. The former `MART_SAME_DIRECTION` / `MART_REVERSE_DIRECTION` enum (`ENUM_MART_MODE`) and the `InpMartMode` input have been **removed** in v10.12. The only behaviour is now reverse-direction.
 
 **State Machine:**
 - Tracks step number, direction, loss streak, cooldown countdown, halt flag, and cycle completion
@@ -220,7 +220,7 @@ When `InpAutoCalibrateMartAtr = true`, the EA on initialization:
 - MT5 offers event-driven `OnBookEvent`, true async execution, hedging mode, and better tick-volume access
 
 🚀 **Risk Research**
-- Centralized martingale gate and mode-aware ADX logic are testbeds for further research
+- Centralized martingale gate and always-reverse direction are testbeds for further research
 - E.g., dynamic step caps based on rolling Sharpe ratio, regime-aware cooldowns
 
 ### Threats
@@ -254,7 +254,7 @@ When `InpAutoCalibrateMartAtr = true`, the EA on initialization:
 
 - **Clean Component Boundary**: Facade + 13 SRP classes with explicit wiring; MT4 handlers only delegate; no global mutable state
 - **Well-Documented Flows**: Mermaid diagrams for DFD, fresh entry, martingale re-entry, auto-calibration, and equity protection simplify auditing
-- **Robustness**: Versioned state files (magic tag `OMM4`), day-stamped drawdown baseline, retry on virtual SL close failures, fail-open on indicator errors (e.g., ADX unavailable)
+- **Robustness**: Versioned state files (magic tag `OMM4` = 0x4F4D4D34), day-stamped drawdown baseline, retry on virtual SL close failures, fail-open on indicator errors (e.g., ADX unavailable)
 - **Performance Note**: `CRangeScanner::Rescan()` performs O(n) scan on every tick with 1,200-sample window. Min-max deque would be O(1) amortized if performance becomes a concern
 
 ### Risk Management Maturity
@@ -265,7 +265,7 @@ When `InpAutoCalibrateMartAtr = true`, the EA on initialization:
 
 ### Observability
 
-- **On-Chart Panel**: Shows range/candle, PPM/zone, spread vs adaptive limit, martingale step and block reasons, loss streak, and halt status—excellent for real-time monitoring
+- **On-Chart Panel**: Shows range/candle, PPM/zone, spread vs adaptive limit, martingale step and block reasons, loss streak, halt status, and reverse-entry countdown — excellent for real-time monitoring
 - **Experts Log**: Detailed event logging; auto-calibration prints ATR and ADX suggestions; step gate reasons reported on block
 
 ### Usability & Guidance
@@ -299,7 +299,7 @@ The code demonstrates several verified best practices:
 ### Provenance
 - Repository exists and is public under [`nhasibuan/oneminuteman`](https://github.com/nhasibuan/oneminuteman)
 - Clear main branch with commit history and two files: README.md and oneminuteman.mq4
-- Recent commits show active development (July 2026), with PR merges, documentation syncs, and feature commits for v10.10–v10.11
+- Recent commits show active development (July 2026), with PR merges, documentation syncs, and feature commits for v10.10–v10.12
 
 ### Contributor List
 - Human maintainer: nhasibuan (Norman Hasibuan)
@@ -307,7 +307,7 @@ The code demonstrates several verified best practices:
 - No suspicious third-party contributors observed
 
 ### Consistency Across Artifacts
-- README content aligns with commit messages ("Add martingale ATR auto-calibration", "mode-aware ADX trend gate (v10.11)", "centralized consecutive-loss protection")
+- README content aligns with commit messages ("Add martingale ATR auto-calibration", "mode-aware ADX trend gate", "centralized consecutive-loss protection", "reverse-entry + force-reverse martingale")
 - Internal consistency: Data dictionary matches described structures and enums
 - Diagrams coherent and match described flows
 
@@ -338,6 +338,7 @@ The code demonstrates several verified best practices:
    - PPM zone classification
    - Candle pattern recognition
    - Block reason log (if entry attempts are blocked)
+   - Reverse-entry countdown (Reverse:ON done=no in X s)
 3. Review Experts log for any warnings or errors
 ```
 
@@ -347,7 +348,7 @@ The code demonstrates several verified best practices:
 2. Let the EA run for 60+ bars to sample volatility
 3. Read Experts log for "Auto-calibrate:" line
 4. Validate suggested ATR thresholds and ADX value for your symbol/broker
-5. Adjust InpMartAtrThreshLow, InpMartAtrThreshHigh, InpMartAdxThresh manually if needed
+5. Adjust InpMartAtrLowPips, InpMartAtrHighPips, InpMartMaxADX manually if needed
 6. Set InpAutoCalibrateMartAtr = false and compile
 ```
 
@@ -355,39 +356,68 @@ The code demonstrates several verified best practices:
 ```
 1. Enable trading on demo: InpEnableTrading = true
 2. Use conservative risk profile:
-   - InpMaxDailyDrawdownPct = 2.0
+   - InpMaxDrawdownPct = 2.0
    - InpMinEquity = 1000
-   - InpMaxDailyLoss = 100
+   - InpMartMaxSteps = 3
 3. Monitor:
    - Daily drawdown curve
    - Consecutive loss streaks
    - Martingale ladder behavior (step count, lot sizes)
    - Equity guard triggers
+   - Time-based reverse-entry firing (~60s after first fill)
 4. Only after 2–4 weeks of stable demo results consider live with 1/10th position size
 ```
 
 ---
 
-## Input Parameters (Key Subset)
+## Input Parameters
 
 | Input | Default | Purpose |
 |---|---|---|
-| `InpEnableTrading` | false | Master kill switch |
-| `InpMaxDailyDrawdownPct` | 2.0 | Daily loss halt (%) |
-| `InpMinEquity` | 1000 | Absolute equity floor |
-| `InpMaxConsecLosses` | 3 | Consecutive-loss pause trigger |
-| `InpMartMaxSteps` | 5 | Max re-entry steps per cycle |
-| `InpMartInitLotMult` | 1.0 | Initial lot multiplier |
-| `InpMartDecaySchedule` | "1.0,1.0,1.0,1.0,1.0" | Lot decay per step |
-| `InpAutoCalibrateMartAtr` | false | Enable on-init calibration |
-| `InpMartAtrThreshLow` | 5.0 | Low-volatility PPM entry gate |
-| `InpMartAtrThreshHigh` | 15.0 | High-volatility PPM entry gate |
-| `InpMartAdxThresh` | 30.0 | ADX trend strength gate |
-| `InpMartMinAtrDist` | 1.5 | Same-bar ATR price-spacing floor |
-| `InpAutoFlattenOnGuardBreach` | false | Auto-flatten if equity guard triggers |
-| `InpReverseAfterMin` | true | Open opposite position 1 min after first entry |
-| `InpReverseDelaySec` | 60 | Delay before reverse entry (seconds) |
-| `InpReverseLots` | 0.0 | Reverse-leg lot size (0 = use `InpBaseLots`) |
+| `InpEnableTrading` | `false` | Master kill switch — EA observes but does not trade when false |
+| `InpBaseLots` | `0.01` | Base lot size for fresh entries and reverse leg (when `InpReverseLots = 0`) |
+| `InpSlippage` | `0` | Order slippage in points; `0` = auto-derived from spread EMA |
+| `InpMaxSpread` | `0` | Max allowed spread in points; `0` = auto-derived from spread EMA |
+| `InpMagic` | `100` | EA magic number — must be unique per chart/symbol |
+| `InpTP_Pips` | `0` | Take-profit in pips; `0` = ATR-dynamic |
+| `InpSL_Pips` | `0` | Stop-loss in pips; `0` = ATR-dynamic |
+| `InpHideSL` | `true` | Use virtual (hidden) SL instead of broker SL |
+| `InpUseSafetySL` | `true` | Send wide real SL to broker as disconnect safety net |
+| `InpSafetySLMult` | `5.0` | Safety SL distance = virtual SL × this multiplier |
+| `InpAtrPeriod` | `14` | ATR period for dynamic risk calculations |
+| `InpAtrSLMult` | `1.5` | SL = ATR × this multiplier |
+| `InpAtrTPMult` | `2.0` | TP = ATR × this multiplier |
+| `InpMinRiskPips` | `1.0` | Minimum floor for any ATR-derived pip distance |
+| `InpMaxDrawdownPct` | `10.0` | Halt trading if daily drawdown ≥ this percentage |
+| `InpMinEquity` | `100.0` | Halt trading if account equity falls below this value |
+| `InpCloseOnGuardBreach` | `true` | Force-close all positions when equity guard triggers |
+| `InpUseMartingale` | `true` | Enable martingale loss-recovery re-entries |
+| `InpMartMult` | `2.0` | Lot multiplier per re-entry step (fallback when schedule empty) |
+| `InpMartMaxSteps` | `5` | Maximum number of martingale re-entries per cycle |
+| `InpMartCooldownBars` | `2` | Bars required between re-entries (fallback when schedule empty) |
+| `InpMartCooldownSchedule` | `"0,0,1,0,1"` | Progressive per-step cooldown bar counts (overrides `InpMartCooldownBars`) |
+| `InpMartMultSchedule` | `"1.0,2.0,1.0,2.0,1.0"` | Per-step lot multiplier schedule (overrides `InpMartMult`) |
+| `InpMaxConsecLosses` | `3` | Pause all entries after this many consecutive losses; `0` = disabled |
+| `InpConsecLossPauseMin` | `1` | Duration (minutes) of consecutive-loss pause |
+| `InpMartMaxADX` | `30.0` | Block reverse re-entry when ADX(M1) is below this value; `0` = disabled |
+| `InpMartADXPeriod` | `14` | ADX period for the trend block gate |
+| `InpMartMinAtrDist` | `0.5` | Same-bar re-entry needs price move ≥ ATR × this; `0` = require new bar |
+| `InpMartConfirm` | `MART_CONFIRM_EITHER` | Reversal confirmation before each re-entry step (NONE/CANDLE/PPM/EITHER/BOTH) |
+| `InpMartAtrLowPips` | `0` | ATR-adaptive steps: full steps at or below this ATR pip level; `0` = disabled |
+| `InpMartAtrHighPips` | `0` | ATR-adaptive steps: only 2 steps above this ATR pip level; `0` = disabled |
+| `InpAutoCalibrateMartAtr` | `false` | Auto-derive ATR low/high pip thresholds from recent M1 bars on init |
+| `InpReverseAfterMin` | `true` | Open an opposite-direction position 1 min (configurable) after the first entry |
+| `InpReverseDelaySec` | `60` | Seconds to wait before firing the time-based reverse leg |
+| `InpReverseLots` | `0.0` | Lot size for the reverse leg; `0` = use `InpBaseLots` |
+| `InpAverPeriod` | `14` | SMA period for candle body average and trend classification |
+| `InpSampleMs` | `50` | Timer interval (ms) for tick-rate range sampling |
+| `InpWindowSize` | `1200` | Ring-buffer size for range scanner (1200 × 50ms = 60s window) |
+| `InpUseVolumeFilter` | `true` | Enable tick-volume spike gate for fresh entries |
+| `InpVolLookback` | `20` | Bars to average for volume filter baseline |
+| `InpVolMultiplier` | `1.5` | Volume must be ≥ average × this multiplier to pass |
+| `InpTzOffsetHours` | `7` | Local timezone offset from GMT (e.g., WIB = +7) |
+| `InpSessionStartHour` | `5` | Session open hour (local time) |
+| `InpSessionEndHour` | `24` | Session close hour (local time) |
 
 ---
 
@@ -412,6 +442,7 @@ The code demonstrates several verified best practices:
 2. **Independent Validation Required**: You must perform your own backtests and demo validation before any live use
 3. **No Official Backtest Statistics**: Trust in the EA's edge must rest on your own testing and code/design quality
 4. **Broker Restrictions**: Many brokers ban or restrict martingale EAs; verify before live deployment
+5. **Hedging Broker Required for Reverse Entry**: `InpReverseAfterMin = true` requires a hedging-capable account; on FIFO/netting accounts the opposite leg will net/close the first position
 
 ### Recommendation
 
@@ -429,7 +460,7 @@ The code demonstrates several verified best practices:
 
 - **Repository**: [nhasibuan/oneminuteman](https://github.com/nhasibuan/oneminuteman)
 - **Author**: [Norman Hasibuan (@nhasibuan)](https://github.com/nhasibuan)
-- **Latest Commit**: July 10, 2026 (v10.11 mode-aware ADX gate fix)
+- **Latest Version**: v10.12 (July 14, 2026) — reverse-entry feature + force-reverse martingale; `ENUM_MART_MODE` / `InpMartMode` removed
 - **For Issues/Questions**: Refer to repository documentation and risk warnings
 
 ---
