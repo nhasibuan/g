@@ -4,7 +4,7 @@
 
 ## Overview
 
-**OneMinuteMan (OMM)** is a single-file, component-based MQL4 Expert Advisor at **version 10.11**, designed for M1 (1-minute) timeframe scalping. Built by [Norman Hasibuan](https://github.com/nhasibuan) with AI-assisted development, it combines candlestick pattern recognition, a ZigZag-based Pips-Per-Minute (PPM) momentum engine, ATR-dynamic risk management, virtual stop-losses, and a multi-layered martingale recovery system.
+**OneMinuteMan (OMM)** is a single-file, component-based MQL4 Expert Advisor at **version 10.12**, designed for M1 (1-minute) timeframe scalping. Built by [Norman Hasibuan](https://github.com/nhasibuan) with AI-assisted development, it combines candlestick pattern recognition, a ZigZag-based Pips-Per-Minute (PPM) momentum engine, ATR-dynamic risk management, virtual stop-losses, and a multi-layered martingale recovery system.
 
 The EA forcibly operates on M1 candle data regardless of the chart timeframe, enabling focused 1-minute scalping strategy with comprehensive protection.
 
@@ -93,6 +93,19 @@ All re-entry decisions pass through a **single centralized decision gate** `CMar
 **State Machine:**
 - Tracks step number, direction, loss streak, cooldown countdown, halt flag, and cycle completion
 - Halt persists across session boundaries and terminal restarts
+
+### Time-Based Reverse Entry
+
+Independent of the martingale recovery path, the EA can open a single opposite-direction position a fixed time after the **first** position opens:
+
+- Enabled by `InpReverseAfterMin` (default **`true`**).
+- **`InpReverseDelaySec`** seconds (default **60** — one minute) after the first entry fills, the EA opens a position in the **opposite** direction.
+- It does **not** wait for the first position to close and does **not** go through any martingale re-entry gates. It uses `MART_CONFIRM_NONE` semantics: no candle / PPM / ADX / ATR / cooldown gates — it opens immediately once the delay has elapsed.
+- Lot size is `InpReverseLots` when `> 0`, otherwise `InpBaseLots`.
+- Fires only **once per cycle**: the guard resets when the account goes flat (no open positions), so the next fresh entry starts a new reverse timer.
+- Runs on both `OnTick` and the millisecond `OnTimer` for sub-second precision, outside the fresh/martingale entry gating (which early-returns while any position is open).
+
+> ⚠️ **Requires a HEDGING-capable broker.** On FIFO / netting accounts the opposite order will net against or close the first position instead of running as a second independent leg.
 
 ### Execution & State Persistence
 
@@ -372,6 +385,9 @@ The code demonstrates several verified best practices:
 | `InpMartAdxThresh` | 30.0 | ADX trend strength gate |
 | `InpMartMinAtrDist` | 1.5 | Same-bar ATR price-spacing floor |
 | `InpAutoFlattenOnGuardBreach` | false | Auto-flatten if equity guard triggers |
+| `InpReverseAfterMin` | true | Open opposite position 1 min after first entry |
+| `InpReverseDelaySec` | 60 | Delay before reverse entry (seconds) |
+| `InpReverseLots` | 0.0 | Reverse-leg lot size (0 = use `InpBaseLots`) |
 
 ---
 

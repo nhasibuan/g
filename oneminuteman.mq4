@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, nhasibuan"
 #property link      "https://github.com/nhasibuan/oneminuteman"
-#property version   "10.11"
+#property version   "10.12"
 #property strict
 #property description "OneMinuteMan v10: Forced-M1 range + candle + PPM engine, rebuilt as a"
 #property description "single-file component architecture. ATR-dynamic risk, virtual SL with"
@@ -151,6 +151,11 @@ input ENUM_MART_CONFIRM InpMartConfirm = MART_CONFIRM_EITHER; // Reversal confir
 input int    InpMartAtrLowPips       = 0;   // 0 = off; ATR-adaptive steps: full steps at or below this ATR pips
 input int    InpMartAtrHighPips      = 0;   // 0 = off; ATR-adaptive steps: only 2 steps above this ATR pips
 input bool   InpAutoCalibrateMartAtr = false; // Auto-derive ATR low/high pip thresholds + suggest ADX from recent M1 bars
+
+//--- Time-Based Reverse Entry
+input bool   InpReverseAfterMin = true;   // Open opposite position 1 min after first entry
+input int    InpReverseDelaySec = 60;     // Delay before reverse entry (seconds)
+input double InpReverseLots     = 0.0;    // 0 = use InpBaseLots
 
 //--- Equity Protection
 input double InpMaxDrawdownPct     = 10.0; // Halt if daily drawdown >= 10%
@@ -1374,6 +1379,9 @@ private:
    datetime         m_halt_until;
    bool             m_initialized;
    datetime         m_last_bar_time;
+   datetime         m_first_open_time; // time the first position opened
+   int              m_first_dir;       // direction of the first position (+1 buy / -1 sell)
+   bool             m_reverse_done;    // guard so the reverse leg fires only once per cycle
 
    void SaveState() {
       m_store.Save(m_mart, m_vsl, m_halted, m_halt_until,
@@ -1419,6 +1427,10 @@ private:
          bool   haltNow = m_mart.OnPositionClosed(profit, closePx);
          if(haltNow) HaltForToday("martingale max steps exhausted on a loss");
          SaveState();
+      }
+      if(n == 0) {
+         m_first_open_time = 0;
+         m_reverse_done    = false;
       }
       m_had_pos = (n > 0);
    }
@@ -1476,12 +1488,35 @@ private:
       double lots = NormalizeLots(InpBaseLots);
       if(m_exec.Open(dir, lots, m_risk, m_vsl, m_spread.EffSlippage())) {
          m_mart.OnFreshEntry(dir, lots);
+         m_first_open_time = TimeCurrent();
+         m_first_dir       = dir;
+         m_reverse_done    = false;
+         SaveState();
+      }
+   }
+
+   // Time-based reverse leg: 1 min (InpReverseDelaySec) after the first
+   // position opens, open an opposite-direction position with no gates
+   // (MART_CONFIRM_NONE semantics). Independent of the martingale path.
+   void ManageReverseEntry() {
+      if(!InpReverseAfterMin || !InpEnableTrading) return;
+      if(m_reverse_done)                           return;
+      if(m_first_open_time == 0)                   return;
+      if(m_exec.CountPositions() != 1)             return;
+      if(TimeCurrent() - m_first_open_time < InpReverseDelaySec) return;
+
+      int    revDir = -m_first_dir;
+      double lots   = (InpReverseLots > 0.0)
+                         ? NormalizeLots(InpReverseLots)
+                         : NormalizeLots(InpBaseLots);
+      if(m_exec.Open(revDir, lots, m_risk, m_vsl, m_spread.EffSlippage())) {
+         m_reverse_done = true;
          SaveState();
       }
    }
 
    void UpdateComment() {
-      string msg = "=== OneMinuteMan v10.11 ===\n";
+      string msg = "=== OneMinuteMan v10.12 ===\n";
       msg += StringFormat("Symbol:%-6s  Engines:M1 (forced)  Chart:%s\n", Symbol(), TFLabel());
       msg += "--- Range ---\n";
       msg += StringFormat("High:%.5f  Low:%.5f  Range:%.5f\n",
@@ -1512,6 +1547,17 @@ private:
       msg += StringFormat("Session: %s  HideSL:%s  VSLs:%d\n",
                           TradingWindowOpen() ? "OPEN" : "CLOSED",
                           InpHideSL ? "ON" : "OFF", m_vsl.Count());
+      {
+         int revIn = -1;
+         if(InpReverseAfterMin && m_first_open_time != 0 && !m_reverse_done) {
+            revIn = (int)(InpReverseDelaySec - (TimeCurrent() - m_first_open_time));
+            if(revIn < 0) revIn = 0;
+         }
+         msg += StringFormat("Reverse:%s done=%s%s\n",
+                             InpReverseAfterMin ? "ON" : "OFF",
+                             m_reverse_done ? "yes" : "no",
+                             revIn >= 0 ? StringFormat(" in %d s", revIn) : "");
+      }
       if(m_halted)
          msg += StringFormat("HALTED until: %s (GMT)\n",
                              TimeToString(m_halt_until, TIME_MINUTES));
@@ -1527,6 +1573,9 @@ public:
       m_halted       = false;
       m_halt_until   = 0;
       m_last_bar_time = 0;
+      m_first_open_time = 0;
+      m_first_dir       = 0;
+      m_reverse_done    = false;
 
       // --- input validation ---
       if(InpWindowSize < 60 || InpWindowSize > 50000)
@@ -1663,7 +1712,7 @@ public:
          { Print("Error: Timer failed"); return INIT_FAILED; }
 
       m_initialized = true;
-      Print("OneMinuteMan v10.11 initialized successfully.");
+      Print("OneMinuteMan v10.12 initialized successfully.");
       return INIT_SUCCEEDED;
    }
 
@@ -1688,6 +1737,7 @@ public:
 
       m_trailing.Manage(m_risk, m_vsl, InpMagic);
       m_vsl.Enforce(m_spread.EffSlippage());
+      ManageReverseEntry();
       UpdateComment();
    }
 
@@ -1712,6 +1762,7 @@ public:
 
       m_trailing.Manage(m_risk, m_vsl, InpMagic);
       m_vsl.Enforce(m_spread.EffSlippage());
+      ManageReverseEntry();
       ManageEntries(newBar);
    }
 
