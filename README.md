@@ -31,7 +31,7 @@ The EA is structured as a **single-file component architecture** using classic O
 |---|---|
 | **Facade** | `CExpertAdvisor` — single entry point delegating all MT4 events |
 | **Single Responsibility** | 13 decoupled component classes, each with one clearly-defined purpose |
-| **Strategy** | Pluggable martingale mode (SAME_DIRECTION / REVERSE_DIRECTION) |
+| **State Machine** | `CMartingaleController` — centralized re-entry decision gate |
 | **Memento** | `CStateStore` — versioned binary state persistence for crash-safe recovery |
 | **Guard Clauses** | No hidden global mutation; all state owned by components |
 
@@ -83,15 +83,12 @@ All re-entry decisions pass through a **single centralized decision gate** `CMar
 2. **ATR-adaptive step cap** — Fewer steps allowed at high volatility; fewer steps = fewer compounding risks
 3. **Progressive cooldown** — Enforces bar delays between steps; schedule is configurable (e.g., `"0,1,2,3,5"` bars)
 4. **Same-bar ATR price-spacing floor** — Price must move ≥ `InpMartMinAtrDist × ATR` before re-entry allowed (prevents stacking on same price)
-5. **Mode-aware ADX trend gate** — **v10.11 fix:**
-   - `SAME_DIRECTION` mode: blocks if ADX is strong (don't average against a strong trend)
-   - `REVERSE_DIRECTION` mode: blocks if ADX is weak (only reverse when a confirmed trend exists)
+5. **ADX trend gate** — Blocks the reverse re-entry when ADX is weak (only reverse when a confirmed trend exists)
 6. **Reversal confirmation** — Configurable: NONE / CANDLE / PPM / EITHER / BOTH
 7. **Decaying multiplier schedule** — Optional lot size decay (e.g., `"2.0,1.8,1.6,1.4,1.2"`) to reduce worst-case drawdown
 
-**Modes:**
-- `SAME_DIRECTION`: Average down (same direction on each loss) → higher cost, lower streak risk
-- `REVERSE_DIRECTION`: Alternate direction after each loss → exploits mean reversion, higher sequence risk
+**Direction:**
+- Re-entries are always **reverse-direction** — each re-entry opens in the opposite direction of the prior (closed) position to exploit mean reversion. The former `SAME_DIRECTION` option has been removed.
 
 **State Machine:**
 - Tracks step number, direction, loss streak, cooldown countdown, halt flag, and cycle completion
@@ -366,7 +363,6 @@ The code demonstrates several verified best practices:
 | `InpMaxDailyDrawdownPct` | 2.0 | Daily loss halt (%) |
 | `InpMinEquity` | 1000 | Absolute equity floor |
 | `InpMaxConsecLosses` | 3 | Consecutive-loss pause trigger |
-| `InpMartMode` | SAME_DIRECTION | Martingale strategy (SAME / REVERSE) |
 | `InpMartMaxSteps` | 5 | Max re-entry steps per cycle |
 | `InpMartInitLotMult` | 1.0 | Initial lot multiplier |
 | `InpMartDecaySchedule` | "1.0,1.0,1.0,1.0,1.0" | Lot decay per step |

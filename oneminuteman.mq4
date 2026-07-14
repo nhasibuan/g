@@ -39,11 +39,6 @@
 //==================================================================
 // SECTION 0 -- ENUMERATIONS
 //==================================================================
-enum ENUM_MART_MODE {
-   MART_SAME_DIRECTION    = 0,
-   MART_REVERSE_DIRECTION = 1
-};
-
 // v10.10 -- reversal confirmation required before each martingale step
 enum ENUM_MART_CONFIRM {
    MART_CONFIRM_NONE   = 0, // no confirmation (time/price gates only)
@@ -140,7 +135,6 @@ input double InpSprEmaAlpha   = 0.05;
 
 //--- Martingale
 input bool           InpUseMartingale    = true;
-input ENUM_MART_MODE InpMartMode         = MART_SAME_DIRECTION;
 input double         InpMartMult         = 2.0;
 input int            InpMartMaxSteps     = 5; // Max re-entries after the initial trade
 input int            InpMartCooldownBars = 2; // Fallback cooldown bars (used when schedule empty)
@@ -150,7 +144,7 @@ input string InpMartCooldownSchedule = "0,0,1,0,1"; // "" = fixed InpMartCooldow
 input string InpMartMultSchedule     = "1.0,2.0,1.0,2.0,1.0"; // "" = fixed InpMartMult (lot multiplier per step)
 input int    InpMaxConsecLosses      = 3;   // 0 = off; pause all entries after N consecutive losses
 input int    InpConsecLossPauseMin   = 1;   // Pause duration in minutes
-input double InpMartMaxADX           = 30.0;// 0 = off; block re-entry when ADX(M1) above or below this
+input double InpMartMaxADX           = 30.0;// 0 = off; block reverse re-entry when ADX(M1) below this
 input int    InpMartADXPeriod        = 14;  // ADX period for the trend block
 input double InpMartMinAtrDist       = 0.5; // 0 = force new bar; same-bar re-entry needs price move >= ATR x this
 input ENUM_MART_CONFIRM InpMartConfirm = MART_CONFIRM_EITHER; // Reversal confirmation before each step
@@ -257,10 +251,6 @@ string TFLabel() {
    string full = EnumToString((ENUM_TIMEFRAMES)_Period);
    StringReplace(full, "PERIOD_", "");
    return full;
-}
-
-string MartModeName(ENUM_MART_MODE m) {
-   return (m == MART_REVERSE_DIRECTION) ? "REVERSE" : "SAME";
 }
 
 string PpmZoneName(PPM_ZONE z) {
@@ -957,7 +947,6 @@ struct REENTRY_CONTEXT {
 class CMartingaleController {
 private:
    bool           m_enabled;
-   ENUM_MART_MODE m_mode;
    double         m_mult;
    int            m_max_steps;
    int            m_cooldown_bars;
@@ -988,13 +977,12 @@ private:
    string   m_block_reason; // last ReentryAllowed() block reason, for the panel
 
 public:
-   void Init(bool enabled, ENUM_MART_MODE mode, double mult, int maxSteps, int cooldownBars,
+   void Init(bool enabled, double mult, int maxSteps, int cooldownBars,
              string cdSchedule, string multSchedule,
              int maxConsecLosses, int pauseMinutes,
              double maxAdx, double minAtrDist, ENUM_MART_CONFIRM confirm,
              int atrLowPips, int atrHighPips) {
       m_enabled           = enabled;
-      m_mode              = mode;
       m_mult              = mult;
       m_max_steps         = maxSteps;
       m_cooldown_bars     = cooldownBars;
@@ -1115,14 +1103,10 @@ public:
             return Block("ATR price spacing");
       }
 
-      // 3. trend gate -- mode-aware (v10.11):
-      //    SAME    : block when ADX above limit (don't average against a strong trend)
-      //    REVERSE : block when ADX below limit (only reverse with a confirmed trend)
+      // 3. trend gate -- reverse re-entries only fire with a confirmed trend:
+      //    block when ADX below limit.
       //    Skipped when disabled (limit <= 0) or ADX unavailable.
-      if(m_max_adx > 0.0 && ctx.adx > 0.0) {
-         if(m_mode == MART_SAME_DIRECTION    && ctx.adx > m_max_adx) return Block("ADX trend block");
-         if(m_mode == MART_REVERSE_DIRECTION && ctx.adx < m_max_adx) return Block("ADX needs trend");
-      }
+      if(m_max_adx > 0.0 && ctx.adx > 0.0 && ctx.adx < m_max_adx) return Block("ADX needs trend");
 
       // 4. reversal confirmation via existing signal engines
       if(!ConfirmationOK(ctx)) return Block("no reversal confirmation");
@@ -1133,7 +1117,7 @@ public:
    string BlockReason() { return m_block_reason; }
 
    int ReentryDir() {
-      return (m_mode == MART_REVERSE_DIRECTION) ? -m_last_dir : m_last_dir;
+      return -m_last_dir;
    }
 
    // v10.10: per-step multiplier schedule (decaying multipliers cut drawdown)
@@ -1513,10 +1497,9 @@ private:
                           InpEnableTrading ? "ON" : "OFF",
                           (int)((Ask - Bid) / Point), m_spread.EffMaxSpread(),
                           AccountEquity(), m_guard.DrawdownPct());
-      msg += StringFormat("Open:%d  Mart:%d/%d (%s) %s\n",
+      msg += StringFormat("Open:%d  Mart:%d/%d %s\n",
                           m_exec.CountPositions(),
                           m_mart.Step(), m_mart.MaxSteps(),
-                          MartModeName(InpMartMode),
                           m_mart.AwaitReentry() ? "[AWAIT]" : "");
       msg += StringFormat("ConsecLosses:%d%s%s\n",
                           m_mart.ConsecLosses(),
@@ -1582,7 +1565,7 @@ public:
                   InpMinRiskPips, InpSL_Pips, InpTP_Pips, InpTrailStart, InpTrailStep);
       m_vsl.Init(InpHideSL);
       m_trailing.Init(InpHideSL, InpBE_LockPips);
-      m_mart.Init(InpUseMartingale, InpMartMode, InpMartMult,
+      m_mart.Init(InpUseMartingale, InpMartMult,
                   InpMartMaxSteps, InpMartCooldownBars,
                   InpMartCooldownSchedule, InpMartMultSchedule,
                   InpMaxConsecLosses, InpConsecLossPauseMin,
@@ -1637,7 +1620,7 @@ public:
                if(adxCount > 0) {
                   ArrayResize(adxValues, adxCount);
                   ArraySort(adxValues, WHOLE_ARRAY, 0, MODE_ASCEND);
-                  double percentile = (InpMartMode == MART_SAME_DIRECTION) ? 0.60 : 0.40;
+                  double percentile = 0.40;
                   int    adxIndex   = (int)MathRound((adxCount - 1) * percentile);
                   adxSuggest        = NormalizeDouble(adxValues[adxIndex], 1);
                }
