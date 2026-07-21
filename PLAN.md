@@ -17,7 +17,7 @@ Refactor **OneMinuteMan** into a pure, signal-based M1 scalping Expert Advisor f
 |---|---|---|
 | Martingale controller | Present (`CMartingaleController`, 7-layer gates) | Removed entirely |
 | Re-entry logic | Centralized state machine | Removed — only fresh entries |
-| Reverse entry (time-based) | Active, independent of martingale | Kept as optional standalone feature |
+| Reverse entry | Concurrent, time-based hedge (needs hedging broker) | Standalone reverse-after-losing-close (all account types) |
 | Martingale inputs | ~20 parameters | Reduced to 0 (all `InpMart*` removed) |
 | State persistence | Includes martingale step, loss streak, pause timers | Simplified: VSL + equity guard only |
 | On-chart panel | Shows martingale step, block reasons, cooldown countdowns | Cleaned up — no martingale fields |
@@ -76,17 +76,21 @@ All conditions below must be true **simultaneously** for an entry:
 - **Equity floor**: Absolute minimum equity threshold; halts trading until next local day
 - **Auto-flatten on breach**: Option to force-close positions when equity guard triggers
 
-### 2.4 Optional Time-Based Reverse Entry
+### 2.4 Optional Reverse-After-Losing-Close Entry
 
-Independent of the primary signal engine. When enabled:
+Independent of the primary signal engine. When enabled (`InpReverseAfterMin = true`):
 
-- Opens one opposite-direction position at a fixed delay after the first entry
-- Does NOT wait for the first position to close
-- Uses no confirmation gates (opens immediately after delay elapses)
-- Requires hedging-capable broker; on FIFO/netting accounts the opposite leg nets against the first
-- Fires only once per cycle (resets when account goes flat)
+- Opens **one** opposite-direction position **after** the first position **closes at a loss** (profit < 0)
+- If the first position closes at breakeven or profit, the reverse leg does **not** fire
+- The trigger is a **losing close** — `m_reverse_armed` is set in `UpdateTradeState()` when `CountPositions()` drops to 0 and `LastClosedProfit() < 0`
+- The reverse entry is a **standalone entry**: the first position is already closed before the reverse opens, so no two positions are ever open simultaneously
+- **Compatible with FIFO/netting accounts** — because the first position is already closed, there is no concurrent opposite leg and no netting conflict
+- `m_first_dir` is preserved across the close so the reverse direction (opposite of the losing trade) is always known
+- An optional `InpReverseDelaySec` delay is measured **from the losing-close timestamp** (`m_loss_close_time`), not from first-open time
+- Fires **exactly once per losing cycle**; `m_reverse_armed` resets when the account is flat and a fresh new cycle begins
+- Lot size: `InpReverseLots` if > 0, otherwise `InpBaseLots`
 
-> ⚠️ **Requires a HEDGING-capable broker.** On FIFO/netting accounts the opposite leg will net/close the first position.
+> ✅ **Compatible with all account types** (hedging and non-hedging / FIFO / netting). The first position is already closed before the reverse leg opens.
 
 ### 2.5 State Persistence
 
@@ -240,12 +244,12 @@ All `InpMart*` parameters are removed. Remaining inputs grouped logically (~45 t
 | `InpSessionStartHour` | int | `5` | Session open hour (local time) |
 | `InpSessionEndHour` | int | `24` | Session close hour (local time) |
 
-### Time-Based Reverse Entry (Optional)
+### Reverse-After-Losing-Close Entry (Optional)
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `InpReverseAfterMin` | bool | `true` | Open opposite position after delay |
-| `InpReverseDelaySec` | int | `60` | Seconds to wait before firing reverse leg |
+| `InpReverseAfterMin` | bool | `true` | Open one opposite-direction position after the first position closes at a loss |
+| `InpReverseDelaySec` | int | `60` | Seconds to wait after the losing close before firing the reverse leg |
 | `InpReverseLots` | double | `0.0` | Reverse leg lots; `0` = use base lots |
 
 ---
@@ -296,6 +300,7 @@ ManageEntries(bool allowFresh):
 
     lots = NormalizeLots(InpBaseLots)
     if m_exec.Open(dir, lots, m_risk, m_vsl, m_spread.EffSlippage()):
+        m_first_dir = dir             // preserve for reverse-after-loss
         SaveState()
 ```
 
@@ -306,14 +311,58 @@ Key simplifications:
 - Single decision point per M1 bar
 - Lot size is always `InpBaseLots` (no multiplier schedules)
 
-### Phase 3: Reverse Entry Isolation
+### Phase 3: Reverse-After-Losing-Close Entry
 
-**Goal:** Keep time-based reverse as an independent optional module.
+**Goal:** Redefine `ManageReverseEntry()` to fire as a standalone post-loss entry, not a concurrent hedge.
 
-- `ManageReverseEntry()` remains unchanged — already operates independently
-- Remove dependency on `m_first_dir` / `m_first_open_time` being cleared by martingale reset
-- Clarify in comments: reverse entry does not participate in the primary signal chain
-- Retain broker hedging caveat in inline comment
+This phase **rewrites** `ManageReverseEntry()` and updates `UpdateTradeState()` arming logic. The key changes:
+
+1. **Arming in `UpdateTradeState()`**: When `CountPositions()` transitions from > 0 to 0, call `m_exec.LastClosedProfit(closePx)`. If `profit < 0` AND `InpReverseAfterMin == true` AND the reverse has not already fired this cycle, set `m_reverse_armed = true` and record `m_loss_close_time = TimeCurrent()`. If `profit >= 0`, clear `m_reverse_armed`.
+2. **`m_first_dir` survives the close**: It is set when a fresh entry opens in `ManageEntries()` and is **not** cleared in `UpdateTradeState()`.
+3. **`ManageReverseEntry()` rewrite**: Returns early unless `InpReverseAfterMin && InpEnableTrading && m_reverse_armed`. Requires `CountPositions() == 0` (standalone — first position is already closed). Optionally waits `InpReverseDelaySec` after `m_loss_close_time` before firing. Opens **one** position in direction opposite to `m_first_dir` using `InpReverseLots > 0 ? InpReverseLots : InpBaseLots`. On success: sets `m_reverse_armed = false`, marks cycle done, calls `SaveState()`.
+4. **Fires exactly once per losing cycle**; armed flag resets when the account is flat and a new fresh cycle begins.
+5. **FIFO/netting compatible** — because `CountPositions() == 0` is required before opening the reverse leg, there is no concurrent opposite position and no netting conflict.
+
+**`UpdateTradeState()` arming pseudocode:**
+
+```
+UpdateTradeState():
+    prev_count = m_position_count
+    m_position_count = m_exec.CountPositions()
+
+    if prev_count > 0 && m_position_count == 0:        // position just closed
+        profit = m_exec.LastClosedProfit(closePx)
+        if profit < 0 && InpReverseAfterMin && !m_reverse_fired_this_cycle:
+            m_reverse_armed    = true
+            m_loss_close_time  = TimeCurrent()
+            // m_first_dir is already set from ManageEntries(); preserve it
+        else:
+            m_reverse_armed = false                    // won or BE — no reverse
+
+    if m_position_count == 0 && !m_reverse_armed:
+        m_reverse_fired_this_cycle = false             // reset for next fresh cycle
+```
+
+**`ManageReverseEntry()` pseudocode:**
+
+```
+ManageReverseEntry():
+    if !InpReverseAfterMin             → return
+    if !InpEnableTrading               → return
+    if !m_reverse_armed                → return
+    if m_exec.CountPositions() > 0     → return        // first position must be closed
+    if TimeCurrent() < m_loss_close_time + InpReverseDelaySec → return   // optional delay
+
+    rev_dir = (m_first_dir == OP_BUY) ? OP_SELL : OP_BUY
+    lots    = (InpReverseLots > 0) ? InpReverseLots : InpBaseLots
+
+    if m_exec.Open(rev_dir, lots, m_risk, m_vsl, m_spread.EffSlippage()):
+        m_reverse_armed            = false
+        m_reverse_fired_this_cycle = true
+        SaveState()
+```
+
+> ✅ **FIFO/netting compatible** — the first position is already closed before the reverse leg opens. No hedging broker required for this path.
 
 ### Phase 4: State Store Simplification
 
@@ -346,6 +395,7 @@ Keep in `CStateStore.Save()`:
 5. Simplify state load — remove martingale restore logic
 6. Update version string from `"10.12"` to `"10.13"`
 7. Update `#property description` text
+8. Initialize `m_reverse_armed = false`, `m_reverse_fired_this_cycle = false`, `m_first_dir = 0`
 
 ### Phase 6: Code Quality & Documentation
 
@@ -373,9 +423,9 @@ Keep in `CStateStore.Save()`:
 | **Max 1 position** | `CTradeExecutor.CountPositions()` never allows > 1 open position per symbol/magic |
 | **Guards active** | Equity guard, spread monitor, session clock all fire correctly |
 | **State persistence** | Virtual SL survives terminal restart; halt flag survives restart; no martingale state corruption |
-| **Reverse entry** | Fires once per cycle at correct delay; requires hedging broker |
+| **Reverse entry** | Fires exactly once per losing cycle, only after the first position closes at a loss, as a standalone entry (no hedging broker required) |
 | **Deterministic output** | Same market data + same inputs → identical trade sequence (no uninitialized variables) |
-| **Panel cleanliness** | On-chart comment shows signal info, PPM, spread, session, reverse countdown — no martingale fields |
+| **Panel cleanliness** | On-chart comment shows signal info, PPM, spread, session, reverse armed/done status — no martingale fields |
 
 ### Code Review Checklist
 
@@ -415,11 +465,55 @@ Without martingale recovery, the risk profile shifts fundamentally:
 | `InpMaxDrawdownPct` | `2.0` | Very tight daily halt |
 | `InpMinEquity` | `1000.0` | Higher floor than default 100 |
 | `InpCloseOnGuardBreach` | `true` | Always flatten on breach |
-| `InpReverseAfterMin` | `false` | Disable reverse initially |
+| `InpReverseAfterMin` | `false` | Disable the loss-triggered reverse initially; enable only after live signal quality is confirmed |
 | `InpUseVolumeFilter` | `true` | Require liquidity confirmation |
 | `InpVolMultiplier` | `1.5` | Moderate spike threshold |
 | `InpPpmMinHigh` | `2.0` | Standard medium zone |
 | `InpPpmTarget` | `4.0` | Standard high zone |
+
+---
+
+## 7.5 SWOT Analysis
+
+EA: **OneMinuteMan v10.13-no-mart** with **Reverse-After-Losing-Close** feature enabled.
+
+### Strengths
+
+- **Fixed linear risk** — no martingale multiplier; every trade uses `InpBaseLots`, so maximum exposure is always known in advance
+- **Bounded worst-case drawdown** — daily DD% halt + absolute equity floor provide a hard ceiling on daily losses, surviving terminal restarts via state persistence
+- **SRP component architecture** — 12 single-responsibility classes; isolated testability, minimal coupling, easy future extension
+- **Crash-safe state persistence (OMM4)** — versioned binary state survives VPS migration, recompile, and terminal crash; VSL registry is fully restored on reinit
+- **Virtual SL + safety SL redundancy** — virtual stop enforced tick-by-tick in memory; wide broker SL acts as a disconnect backstop; two independent layers of stop protection
+- **Reverse-after-loss works on all account types** — because the first position is already closed before the reverse fires, there is no hedging dependency; fully FIFO/netting compatible
+- **Single-position invariant** — `CountPositions()` hard-blocks any second open position; no runaway multi-order state
+- **Deterministic execution** — same inputs + same market data → identical trade sequence; no hidden randomness or uninitialized state
+
+### Weaknesses
+
+- **No loss recovery or averaging** — win rate must be structurally higher than break-even; a string of losses is absorbed directly with no offset mechanism
+- **Reverse leg can compound losses** — the reverse fires on an already-losing cycle; if the reverse trade also loses, two consecutive losses occur in one cycle, which can accelerate drawdown
+- **ZigZag repaint risk** — ZigZag redraws past pivots on incomplete bars; PPM readings on the current bar are provisional until bar close
+- **Single-file MQL4 size constraint** — at ~61 KB the file is near practical MQL4 limits; additional features would require DLL refactoring
+- **Dependence on reliable `OrderClose` for virtual SL** — network latency or broker restrictions can delay virtual stop enforcement; safety SL only partially mitigates this
+- **No backtest or statistical edge evidence** — no walk-forward results, no `.set` profile validation; signal quality and win rate are unverified outside manual observation
+
+### Opportunities
+
+- **Mean-reversion capture** — the reverse-after-loss leg is well-suited to mean-reversion after a failed breakout; the losing direction often exhausts momentum, setting up the opposite move
+- **Session/pair parameter tuning** — ATR multipliers, PPM thresholds, and volume filters can be calibrated independently per session (London, NY) and per pair for improved edge
+- **Portability to netting/FIFO brokers** — FIFO compliance broadens the deployable audience to prop-firm, US-regulated, and ECN accounts that prohibit concurrent opposite legs
+- **Prop-firm / funded-account suitability** — conservative profile (tight DD%, fixed lots, equity floor, no martingale) aligns well with typical prop-firm challenge rules
+- **Optional confirmation gate on reverse leg** — future enhancement: add a lightweight signal filter (e.g. candle direction, spread check) before firing the reverse, reducing wrong-way risk
+- **Configurable delay as a market-noise filter** — `InpReverseDelaySec` can be tuned to skip the first few seconds of post-close noise and enter after price stabilises
+
+### Threats
+
+- **Consecutive-loss sequences** — if both the original leg and the reverse leg lose in the same cycle, net loss per cycle doubles; repeated occurrences drain equity faster than a single-trade-per-signal model
+- **High-spread / low-liquidity M1 conditions** — M1 scalping is highly sensitive to spread spikes; during news events or illiquid hours, virtual SL may be breached before the spread normalises
+- **Broker execution latency / requotes** — scalping at M1 frequency is vulnerable to slow order execution, partial fills, or requotes that widen the effective entry price beyond signal intent
+- **Over-trading in choppy / ranging markets** — M1 signals are prone to false breakouts in sideways price action; without a range-filter, entry frequency increases while win rate drops
+- **Reverse leg firing into a continuing trend (wrong-way risk)** — if the first trade lost because it was counter-trend, the reverse (opposite direction) is now with-trend; however, if the trend is strong and accelerating, a delayed reverse entry may still lose
+- **Regulatory or broker restrictions on scalping** — some brokers impose minimum trade duration rules or disallow rapid open/close sequences; M1 EAs may violate these terms of service
 
 ---
 
@@ -482,7 +576,7 @@ Expected final file size: ~61 KB (down from ~67 KB).
 
 4. **Broker dependency** — Virtual SL requires reliable `OrderClose` execution. Network latency or broker-side restrictions can cause missed virtual stops. Safety SL provides partial mitigation.
 
-5. **Time-based reverse requires hedging** — On FIFO/netting-broker accounts, opening an opposite position while the first is still open will net/close rather than run as two legs.
+5. **Reverse leg only triggers on a losing close** — If the first trade wins or closes at breakeven, no reverse leg fires for that cycle. The reverse adds one extra trade per losing cycle; if the reverse also loses, net per-cycle loss doubles. There is no hedging broker requirement — the first position is fully closed before the reverse opens.
 
 6. **No backtesting evidence** — This EA has no official `.set` profiles, walk-forward results, or statistical edge verification. Users must validate independently on demo.
 
@@ -520,7 +614,7 @@ The project is complete when all of the following are confirmed:
 - [ ] `ManageEntries()` executes only fresh signal logic
 - [ ] `CStateStore` saves/loads only VSL + equity guard + halt state
 - [ ] On-chart panel shows clean signal info without martingale fields
-- [ ] Time-based reverse entry works independently
+- [ ] Reverse-after-losing-close entry fires once per losing cycle, standalone, no hedging requirement
 - [ ] State persistence verified across terminal restart
 - [ ] Daily drawdown halt and equity floor functional
 - [ ] Virtual SL enforcement working (tested in strategy tester)
