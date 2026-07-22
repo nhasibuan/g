@@ -5,14 +5,18 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, nhasibuan"
 #property link      "https://github.com/nhasibuan/oneminuteman"
-#property version   "10.12"
+#property version   "10.13"
 #property strict
-#property description "OneMinuteMan v10: Forced-M1 range + candle + PPM engine, rebuilt as a"
-#property description "single-file component architecture. ATR-dynamic risk, virtual SL with"
-#property description "safety net, break-even, persistent equity guards, martingale recovery."
+#property description "OneMinuteMan v10.13: Signal-only M1 scalper with event-driven loss-reversal."
+#property description "No martingale. Fixed linear risk. FIFO/netting compatible."
+#property description "ATR-dynamic risk, virtual SL with safety net, break-even, persistent equity guards."
 
 //==================================================================
 //  ARCHITECTURE (single file, component-based)
+//  -----------------------------------------------------------------
+//  v10.13-no-mart: Martingale removed. Signal-only entry with
+//  optional event-driven loss-reversal (reverse after losing close).
+//  FIFO/netting compatible -- no concurrent hedging.
 //  -----------------------------------------------------------------
 //  Design patterns applied:
 //   - Facade            : CExpertAdvisor is the single entry point that
@@ -28,8 +32,6 @@
 //       CRiskModel            ATR-dynamic SL/TP/trailing resolution
 //       CVirtualStopManager   hidden SL registry + enforcement
 //       CTrailingManager      break-even + trailing stop logic
-//       CMartingaleController loss-recovery state machine + all
-//                             centralized re-entry protections (v10.10)
 //       CTradeExecutor        order send / flatten / history scan
 //       CStateStore           versioned binary persistence (Memento)
 //   - Guard clauses everywhere; no hidden global mutation: all state
@@ -39,10 +41,11 @@
 //==================================================================
 // SECTION 0 -- ENUMERATIONS
 //==================================================================
-// v10.10 -- reversal confirmation required before each martingale step
+// Reversal confirmation -- repurposed from v10.12 martingale gate
+// to v10.13 loss-reversal signal confirmation filter.
 enum ENUM_MART_CONFIRM {
-   MART_CONFIRM_NONE   = 0, // no confirmation (time/price gates only)
-   MART_CONFIRM_CANDLE = 1, // candle signal must agree with re-entry direction
+   MART_CONFIRM_NONE   = 0, // no confirmation (fires on delay only)
+   MART_CONFIRM_CANDLE = 1, // candle signal must agree with reverse direction
    MART_CONFIRM_PPM    = 2, // PPM zone must be MEDIUM or HIGH
    MART_CONFIRM_EITHER = 3, // candle OR PPM
    MART_CONFIRM_BOTH   = 4  // candle AND PPM
@@ -133,29 +136,17 @@ input double InpMaxSpreadMult = 2.5;
 input double InpSlippageMult  = 1.5;
 input double InpSprEmaAlpha   = 0.05;
 
-//--- Martingale
-input bool           InpUseMartingale    = true;
-input double         InpMartMult         = 2.0;
-input int            InpMartMaxSteps     = 5; // Max re-entries after the initial trade
-input int            InpMartCooldownBars = 2; // Fallback cooldown bars (used when schedule empty)
-
-//--- Martingale: Consecutive-Loss Protection (v10.10)
-input string InpMartCooldownSchedule = "0,0,1,0,1"; // "" = fixed InpMartCooldownBars (progressive cooldown bars per step)
-input string InpMartMultSchedule     = "1.0,2.0,1.0,2.0,1.0"; // "" = fixed InpMartMult (lot multiplier per step)
-input int    InpMaxConsecLosses      = 3;   // 0 = off; pause all entries after N consecutive losses
-input int    InpConsecLossPauseMin   = 1;   // Pause duration in minutes
-input double InpMartMaxADX           = 30.0;// 0 = off; block reverse re-entry when ADX(M1) below this
-input int    InpMartADXPeriod        = 14;  // ADX period for the trend block
-input double InpMartMinAtrDist       = 0.5; // 0 = force new bar; same-bar re-entry needs price move >= ATR x this
-input ENUM_MART_CONFIRM InpMartConfirm = MART_CONFIRM_EITHER; // Reversal confirmation before each step
-input int    InpMartAtrLowPips       = 0;   // 0 = off; ATR-adaptive steps: full steps at or below this ATR pips
-input int    InpMartAtrHighPips      = 0;   // 0 = off; ATR-adaptive steps: only 2 steps above this ATR pips
-input bool   InpAutoCalibrateMartAtr = false; // Auto-derive ATR low/high pip thresholds + suggest ADX from recent M1 bars
-
-//--- Time-Based Reverse Entry
-input bool   InpReverseAfterMin = true;   // Open opposite position 1 min after first entry
-input int    InpReverseDelaySec = 60;     // Delay before reverse entry (seconds)
-input double InpReverseLots     = 0.0;    // 0 = use InpBaseLots
+//--- Loss-Reversal Engine (v10.13)
+//    Event-driven reverse-after-losing-close.
+//    FIFO/netting compatible: waits for flat account before opening reverse.
+//    "Losing close" = LastClosedProfit() < 0 (includes swap + commission).
+input bool              InpEnableLossReversal    = true;  // Enable reverse-after-losing-close
+input int               InpLossReversalDelaySec  = 5;     // Delay (seconds) after losing close before reverse entry
+input double            InpReverseLots           = 0.0;   // 0 = use InpBaseLots
+input ENUM_MART_CONFIRM InpReverseConfirm        = MART_CONFIRM_NONE; // Signal confirmation for reverse leg
+input int               InpMaxReverseLossesPerDay = 3;    // 0 = unlimited; max reverse losses before disabling for day
+input int               InpMaxTradesPerDay       = 0;     // 0 = unlimited; max total trades per day
+input int               InpMinHoldSec            = 0;     // 0 = off; minimum seconds to hold before closing
 
 //--- Equity Protection
 input double InpMaxDrawdownPct     = 10.0; // Halt if daily drawdown >= 10%
@@ -171,7 +162,7 @@ input int    InpSessionEndHour   = 24;
 // SECTION 2 -- CONSTANTS, STRUCTURES & UTILITIES
 //==================================================================
 #define MAX_POSITIONS 20
-#define STATE_MAGIC   0x4F4D4D34 // "OMM4" -- v10.10 state format tag
+#define STATE_MAGIC   0x4F4D4D35 // "OMM5" -- v10.13 state format tag (bumped from OMM4)
 
 const double LONG_BODY_FACTOR   = 1.3;
 const double SHORT_BODY_FACTOR  = 0.5;
@@ -229,29 +220,6 @@ double NormalizeLots(double lots) {
    return NormalizeDouble(MathMin(MathMax(lots, minlot), maxlot), 2);
 }
 
-// v10.10 -- parse comma-separated schedules for progressive cooldown / multiplier
-int ParseIntList(string csv, int &out[], int cap) {
-   string parts[];
-   int n = StringSplit(csv, ',', parts);
-   int k = 0;
-   for(int i = 0; i < n && k < cap; i++) {
-      if(StringLen(parts[i]) == 0) continue;
-      out[k++] = (int)StringToInteger(parts[i]);
-   }
-   return k;
-}
-
-int ParseDoubleList(string csv, double &out[], int cap) {
-   string parts[];
-   int n = StringSplit(csv, ',', parts);
-   int k = 0;
-   for(int i = 0; i < n && k < cap; i++) {
-      if(StringLen(parts[i]) == 0) continue;
-      out[k++] = StringToDouble(parts[i]);
-   }
-   return k;
-}
-
 string TFLabel() {
    string full = EnumToString((ENUM_TIMEFRAMES)_Period);
    StringReplace(full, "PERIOD_", "");
@@ -289,6 +257,17 @@ string TrendName(TYPE_TREND u) {
       case TREND_DOWN:    return "Descending";
       case TREND_LATERAL: return "Lateral";
       default:            return "Unknown";
+   }
+}
+
+string ConfirmName(ENUM_MART_CONFIRM c) {
+   switch(c) {
+      case MART_CONFIRM_NONE:   return "NONE";
+      case MART_CONFIRM_CANDLE: return "CANDLE";
+      case MART_CONFIRM_PPM:    return "PPM";
+      case MART_CONFIRM_EITHER: return "EITHER";
+      case MART_CONFIRM_BOTH:   return "BOTH";
+      default:                  return "?";
    }
 }
 
@@ -922,269 +901,7 @@ public:
 };
 
 //==================================================================
-// SECTION 13 -- CMartingaleController : loss-recovery state machine
-//==================================================================
-// FIX-5: step semantics now match the documentation. A fresh trade is
-// step 0; each re-entry increments the step; re-entries are allowed while
-// step < MaxSteps, so MaxSteps really is the number of re-entries.
-//
-// v10.10: ALL re-entry checks are centralized in ReentryAllowed() -- the
-// single decision point for every martingale attempt. New protections:
-//   - progressive per-step cooldown schedule
-//   - consecutive-loss limiter (pauses ALL entries)
-//   - ADX trend block (no martingale against a strong trend)
-//   - ATR price-spacing floor (same-bar re-entry needs real price movement)
-//   - ATR-adaptive max steps (high volatility -> fewer steps)
-//   - reversal confirmation via candle signal and/or PPM zone
-
-// Market snapshot handed to the centralized re-entry decision
-struct REENTRY_CONTEXT {
-   double atr_pips;           // current ATR in pips (0 = unavailable)
-   double adx;                // ADX(M1) on last closed bar (-1 = unavailable)
-   double price;              // current Bid
-   int    candle_dir;         // candle signal direction (+1/-1/0), 0 = none/invalid
-   int    ppm_zone;           // PPM_ZONE value, -1 = invalid
-   bool   new_bar_since_loss; // at least one new M1 bar since the losing close
-};
-
-#define MART_SCHED_CAP 16
-
-class CMartingaleController {
-private:
-   bool           m_enabled;
-   double         m_mult;
-   int            m_max_steps;
-   int            m_cooldown_bars;
-
-   // v10.10 protection config
-   int               m_cd_sched[MART_SCHED_CAP];
-   int               m_cd_sched_n;
-   double            m_mult_sched[MART_SCHED_CAP];
-   int               m_mult_sched_n;
-   int               m_max_consec_losses;
-   int               m_pause_minutes;
-   double            m_max_adx;
-   double            m_min_atr_dist;
-   ENUM_MART_CONFIRM m_confirm;
-   int               m_atr_low_pips;
-   int               m_atr_high_pips;
-
-   // runtime state (persisted)
-   int      m_step;
-   int      m_last_dir;
-   double   m_last_lots;
-   bool     m_await_reentry;
-   datetime m_last_loss_time;
-   int      m_consec_losses;
-   datetime m_pause_until;
-   double   m_last_loss_price;
-
-   string   m_block_reason; // last ReentryAllowed() block reason, for the panel
-
-public:
-   void Init(bool enabled, double mult, int maxSteps, int cooldownBars,
-             string cdSchedule, string multSchedule,
-             int maxConsecLosses, int pauseMinutes,
-             double maxAdx, double minAtrDist, ENUM_MART_CONFIRM confirm,
-             int atrLowPips, int atrHighPips) {
-      m_enabled           = enabled;
-      m_mult              = mult;
-      m_max_steps         = maxSteps;
-      m_cooldown_bars     = cooldownBars;
-      m_cd_sched_n        = ParseIntList(cdSchedule, m_cd_sched, MART_SCHED_CAP);
-      m_mult_sched_n      = ParseDoubleList(multSchedule, m_mult_sched, MART_SCHED_CAP);
-      m_max_consec_losses = maxConsecLosses;
-      m_pause_minutes     = pauseMinutes;
-      m_max_adx           = maxAdx;
-      m_min_atr_dist      = minAtrDist;
-      m_confirm           = confirm;
-      m_atr_low_pips      = atrLowPips;
-      m_atr_high_pips     = atrHighPips;
-      m_last_dir          = 0;
-      m_last_lots         = 0.0;
-      m_consec_losses     = 0;
-      m_pause_until       = 0;
-      m_last_loss_price   = 0.0;
-      m_block_reason      = "";
-      ResetCycle();
-   }
-
-   void SetAtrThresholds(int lowPips, int highPips) {
-      m_atr_low_pips  = lowPips;
-      m_atr_high_pips = highPips;
-   }
-
-   void ResetCycle() {
-      m_step          = 0;
-      m_await_reentry = false;
-      m_last_loss_time = 0;
-   }
-
-   int    Step()         { return m_step; }
-   int    MaxSteps()     { return m_max_steps; }
-   bool   AwaitReentry() { return m_await_reentry; }
-   int    LastDir()      { return m_last_dir; }
-
-   void OnFreshEntry(int dir, double lots) {
-      m_step          = 0;
-      m_last_dir      = dir;
-      m_last_lots     = lots;
-      m_await_reentry = false;
-   }
-
-   void OnReentry(int dir, double lots) {
-      m_step++;
-      m_last_dir      = dir;
-      m_last_lots     = lots;
-      m_await_reentry = false;
-   }
-
-   // Returns true when the loss should halt trading for the day.
-   // v10.10: also tracks the consecutive-loss streak (across cycles) and
-   // arms the entry pause when the streak reaches the limit.
-   bool OnPositionClosed(double profit, double closePrice) {
-      if(profit >= 0.0) {
-         m_consec_losses = 0;
-         ResetCycle();
-         return false;
-      }
-      m_consec_losses++;
-      m_last_loss_price = closePrice;
-      if(m_max_consec_losses > 0 && m_consec_losses >= m_max_consec_losses) {
-         m_pause_until = TimeCurrent() + m_pause_minutes * 60;
-         Print("Consecutive-loss limiter: ", m_consec_losses,
-               " losses in a row -- pausing all entries for ", m_pause_minutes, " min.");
-      }
-      if(!m_enabled)            { ResetCycle(); return false; }
-      if(m_step >= m_max_steps) { ResetCycle(); return true; }
-      m_await_reentry  = true;
-      m_last_loss_time = TimeCurrent();
-      return false;
-   }
-
-   // v10.10: consecutive-loss pause -- gates ALL entries (fresh + martingale)
-   bool EntryPaused() {
-      return (m_pause_until > 0 && TimeCurrent() < m_pause_until);
-   }
-
-   // Progressive cooldown: bars required before re-entry #(m_step+1).
-   int CooldownBarsForStep() {
-      if(m_cd_sched_n > 0)
-         return m_cd_sched[(int)MathMin(m_step, m_cd_sched_n - 1)];
-      return m_cooldown_bars;
-   }
-
-   // ATR-adaptive max steps: heuristic, demo-validate before live use.
-   int EffectiveMaxSteps(double atrPips) {
-      if(m_atr_low_pips <= 0 || m_atr_high_pips <= 0 || atrPips <= 0.0) return m_max_steps;
-      if(atrPips <= m_atr_low_pips)  return m_max_steps;
-      if(atrPips <= m_atr_high_pips) return (int)MathMax(m_max_steps - 1, 1);
-      return (int)MathMin(2, m_max_steps);
-   }
-
-   // Cheap pre-check used by the facade before building a full context
-   bool CanReenter() {
-      return (m_enabled && m_await_reentry && m_step < m_max_steps);
-   }
-
-   // v10.10: THE single decision point for every martingale attempt.
-   bool ReentryAllowed(const REENTRY_CONTEXT &ctx) {
-      m_block_reason = "";
-      if(!m_enabled || !m_await_reentry)              return Block("idle");
-      if(EntryPaused())                               return Block("consec-loss pause");
-      if(m_step >= EffectiveMaxSteps(ctx.atr_pips))   return Block("step cap (ATR-adaptive)");
-
-      // 1. progressive cooldown (bar-based)
-      int barsSinceLoss = (m_last_loss_time == 0)
-         ? 9999 : iBarShift(Symbol(), PERIOD_M1, m_last_loss_time);
-      if(barsSinceLoss < CooldownBarsForStep())        return Block("cooldown");
-
-      // 2. hard floor: require a new M1 bar OR a real price move from the losing close
-      if(!ctx.new_bar_since_loss) {
-         if(m_min_atr_dist <= 0.0 || ctx.atr_pips <= 0.0 || m_last_loss_price <= 0.0)
-            return Block("same-bar re-entry (no spacing data)");
-         double needed = ctx.atr_pips * PipSize() * m_min_atr_dist;
-         if(MathAbs(ctx.price - m_last_loss_price) < needed)
-            return Block("ATR price spacing");
-      }
-
-      // 3. trend gate -- reverse re-entries only fire with a confirmed trend:
-      //    block when ADX below limit.
-      //    Skipped when disabled (limit <= 0) or ADX unavailable.
-      if(m_max_adx > 0.0 && ctx.adx > 0.0 && ctx.adx < m_max_adx) return Block("ADX needs trend");
-
-      // 4. reversal confirmation via existing signal engines
-      if(!ConfirmationOK(ctx)) return Block("no reversal confirmation");
-
-      return true;
-   }
-
-   string BlockReason() { return m_block_reason; }
-
-   int ReentryDir() {
-      return -m_last_dir;
-   }
-
-   // v10.10: per-step multiplier schedule (decaying multipliers cut drawdown)
-   double MultForStep() {
-      if(m_mult_sched_n > 0)
-         return m_mult_sched[(int)MathMin(m_step, m_mult_sched_n - 1)];
-      return m_mult;
-   }
-
-   double ReentryLots(double baseLots) {
-      double base = (m_last_lots > 0.0) ? m_last_lots : baseLots;
-      return NormalizeLots(base * MultForStep());
-   }
-
-   int      ConsecLosses() { return m_consec_losses; }
-   datetime PauseUntil()   { return m_pause_until; }
-   datetime LastLossTime() { return m_last_loss_time; }
-
-private:
-   bool Block(string why) { m_block_reason = why; return false; }
-
-   bool ConfirmationOK(const REENTRY_CONTEXT &ctx) {
-      if(m_confirm == MART_CONFIRM_NONE) return true;
-      bool candleOk = (ctx.candle_dir != 0 && ctx.candle_dir == ReentryDir());
-      bool ppmOk    = (ctx.ppm_zone >= PPM_ZONE_MEDIUM);
-      switch(m_confirm) {
-         case MART_CONFIRM_CANDLE: return candleOk;
-         case MART_CONFIRM_PPM:    return ppmOk;
-         case MART_CONFIRM_EITHER: return (candleOk || ppmOk);
-         case MART_CONFIRM_BOTH:   return (candleOk && ppmOk);
-      }
-      return false;
-   }
-
-public:
-   // --- persistence hooks (Memento) ---
-   void WriteTo(int h) {
-      FileWriteInteger(h, m_step);
-      FileWriteInteger(h, m_last_dir);
-      FileWriteDouble(h,  m_last_lots);
-      FileWriteInteger(h, m_await_reentry ? 1 : 0);
-      FileWriteLong(h,    (long)m_last_loss_time);
-      // v10.10 additions (state tag bumped to OMM4)
-      FileWriteInteger(h, m_consec_losses);
-      FileWriteLong(h,    (long)m_pause_until);
-      FileWriteDouble(h,  m_last_loss_price);
-   }
-
-   void ReadFrom(int h) {
-      m_step            = FileReadInteger(h);
-      m_last_dir        = FileReadInteger(h);
-      m_last_lots       = FileReadDouble(h);
-      m_await_reentry   = (FileReadInteger(h) != 0);
-      m_last_loss_time  = (datetime)FileReadLong(h);
-      m_consec_losses   = FileReadInteger(h);
-      m_pause_until     = (datetime)FileReadLong(h);
-      m_last_loss_price = FileReadDouble(h);
-   }
-};
-
-//==================================================================
-// SECTION 14 -- CTradeExecutor : order send / flatten / history scan
+// SECTION 13 -- CTradeExecutor : order send / flatten / history scan
 //==================================================================
 class CTradeExecutor {
 private:
@@ -1214,6 +931,8 @@ public:
       return n;
    }
 
+   // Returns the net profit of the most recently closed position (includes swap+commission).
+   // "Losing close" is defined as LastClosedProfit() < 0.
    double LastClosedProfit(double &closePrice) {
       datetime best = 0;
       double   prof = 0.0;
@@ -1230,6 +949,23 @@ public:
          }
       }
       return prof;
+   }
+
+   // Returns the direction of the most recently closed position (+1 buy, -1 sell, 0 none).
+   int LastClosedDir() {
+      datetime best = 0;
+      int      dir  = 0;
+      for(int i = OrdersHistoryTotal() - 1; i >= 0; i--) {
+         if(!OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) continue;
+         if(OrderSymbol()      != Symbol()  ||
+            OrderMagicNumber() != m_magic)    continue;
+         if(OrderType() != OP_BUY && OrderType() != OP_SELL) continue;
+         if(OrderCloseTime() > best) {
+            best = OrderCloseTime();
+            dir  = (OrderType() == OP_BUY) ? +1 : -1;
+         }
+      }
+      return dir;
    }
 
    bool Open(int dir, double lots, CRiskModel &risk, CVirtualStopManager &vsl, int slippage) {
@@ -1298,12 +1034,13 @@ public:
 };
 
 //==================================================================
-// SECTION 15 -- CStateStore : versioned binary persistence (Memento)
+// SECTION 14 -- CStateStore : versioned binary persistence (Memento)
 //==================================================================
+// v10.13: Martingale fields removed. Loss-reversal state added.
+// Format: OMM5 (0x4F4D4D35). Old OMM4 files safely discarded.
 // FIX-4: the halt flag, halt-until time, day baseline and day stamp are
 // now persisted, so a terminal restart can no longer bypass the daily
-// drawdown halt or re-anchor the baseline. The file carries a magic tag;
-// pre-v10 state files fail the tag check and are discarded safely.
+// drawdown halt or re-anchor the baseline.
 class CStateStore {
 private:
    string m_filename;
@@ -1313,38 +1050,56 @@ public:
       m_filename = "OMM_State_" + Symbol() + "_" + IntegerToString(magic) + ".bin";
    }
 
-   void Save(CMartingaleController &mart, CVirtualStopManager &vsl,
-             bool halted, datetime haltUntil, double dayBaseline, int dayStamp) {
+   void Save(CVirtualStopManager &vsl,
+             bool halted, datetime haltUntil, double dayBaseline, int dayStamp,
+             int reversalLossesToday, int tradesToday,
+             datetime lastLossCloseTime, bool reversalPending, int reversalDir) {
       int h = FileOpen(m_filename, FILE_WRITE | FILE_BIN);
       if(h == INVALID_HANDLE) {
          Print("SaveState: cannot open ", m_filename, " err=", GetLastError());
          return;
       }
       FileWriteInteger(h, STATE_MAGIC);
-      mart.WriteTo(h);
+      // equity guard state
       FileWriteInteger(h, halted ? 1 : 0);
       FileWriteLong(h,    (long)haltUntil);
       FileWriteDouble(h,  dayBaseline);
       FileWriteInteger(h, dayStamp);
+      // loss-reversal state (v10.13)
+      FileWriteInteger(h, reversalLossesToday);
+      FileWriteInteger(h, tradesToday);
+      FileWriteLong(h,    (long)lastLossCloseTime);
+      FileWriteInteger(h, reversalPending ? 1 : 0);
+      FileWriteInteger(h, reversalDir);
+      // virtual stop manager
       vsl.WriteTo(h);
       FileClose(h);
    }
 
-   bool Load(CMartingaleController &mart, CVirtualStopManager &vsl,
-             bool &halted, datetime &haltUntil, double &dayBaseline, int &dayStamp) {
+   bool Load(CVirtualStopManager &vsl,
+             bool &halted, datetime &haltUntil, double &dayBaseline, int &dayStamp,
+             int &reversalLossesToday, int &tradesToday,
+             datetime &lastLossCloseTime, bool &reversalPending, int &reversalDir) {
       int h = FileOpen(m_filename, FILE_READ | FILE_BIN);
       if(h == INVALID_HANDLE) return false;
       int tag = FileReadInteger(h);
       if(tag != STATE_MAGIC) {
          FileClose(h);
-         Print("State file has old/unknown format -- starting fresh.");
+         Print("State file has old/unknown format (expected OMM5) -- starting fresh.");
          return false;
       }
-      mart.ReadFrom(h);
+      // equity guard state
       halted      = (FileReadInteger(h) != 0);
       haltUntil   = (datetime)FileReadLong(h);
       dayBaseline = FileReadDouble(h);
       dayStamp    = FileReadInteger(h);
+      // loss-reversal state (v10.13)
+      reversalLossesToday = FileReadInteger(h);
+      tradesToday         = FileReadInteger(h);
+      lastLossCloseTime   = (datetime)FileReadLong(h);
+      reversalPending     = (FileReadInteger(h) != 0);
+      reversalDir         = FileReadInteger(h);
+      // virtual stop manager
       vsl.ReadFrom(h);
       FileClose(h);
       return true;
@@ -1352,8 +1107,10 @@ public:
 };
 
 //==================================================================
-// SECTION 16 -- CExpertAdvisor : Facade wiring all components
+// SECTION 15 -- CExpertAdvisor : Facade wiring all components
 //==================================================================
+// v10.13: Martingale controller removed. Signal-only entry with
+// event-driven loss-reversal. FIFO/netting compatible.
 class CExpertAdvisor {
 private:
    CSpreadMonitor        m_spread;
@@ -1366,7 +1123,6 @@ private:
    CRiskModel            m_risk;
    CVirtualStopManager   m_vsl;
    CTrailingManager      m_trailing;
-   CMartingaleController m_mart;
    CTradeExecutor        m_exec;
    CStateStore           m_store;
 
@@ -1379,13 +1135,20 @@ private:
    datetime         m_halt_until;
    bool             m_initialized;
    datetime         m_last_bar_time;
-   datetime         m_first_open_time; // time the first position opened
-   int              m_first_dir;       // direction of the first position (+1 buy / -1 sell)
-   bool             m_reverse_done;    // guard so the reverse leg fires only once per cycle
+
+   // v10.13 loss-reversal state
+   bool             m_reversal_pending;   // armed after a losing close
+   int              m_reversal_dir;       // direction for the reverse leg (+1/-1)
+   datetime         m_last_loss_close_time; // when the losing position closed
+   int              m_reversal_losses_today; // count of reverse-leg losses today
+   int              m_trades_today;       // total trades opened today
+   bool             m_last_was_reversal;  // true if the current/last position was a reverse leg
 
    void SaveState() {
-      m_store.Save(m_mart, m_vsl, m_halted, m_halt_until,
-                   m_guard.Baseline(), m_guard.DayStamp());
+      m_store.Save(m_vsl, m_halted, m_halt_until,
+                   m_guard.Baseline(), m_guard.DayStamp(),
+                   m_reversal_losses_today, m_trades_today,
+                   m_last_loss_close_time, m_reversal_pending, m_reversal_dir);
    }
 
    void HaltForToday(string reason) {
@@ -1414,70 +1177,134 @@ private:
          Print("Equity guard breached with open positions -- flattening. (", reason, ")");
          m_exec.CloseAll(m_spread.EffSlippage(), m_vsl);
       }
-      m_mart.ResetCycle();
+      m_reversal_pending = false;
       HaltForToday(reason);
       return false;
    }
 
+   // v10.13: Detect position closure and arm loss-reversal if applicable.
    void UpdateTradeState() {
       int n = m_exec.CountPositions();
       if(n == 0 && m_had_pos) {
+         // A position just closed -- check if it was a loss
          double closePx = 0.0;
          double profit  = m_exec.LastClosedProfit(closePx);
-         bool   haltNow = m_mart.OnPositionClosed(profit, closePx);
-         if(haltNow) HaltForToday("martingale max steps exhausted on a loss");
+         int    lastDir = m_exec.LastClosedDir();
+
+         if(profit < 0.0) {
+            // Track reverse-leg losses separately
+            if(m_last_was_reversal) {
+               m_reversal_losses_today++;
+            }
+            // Arm the loss-reversal if enabled and within daily limits
+            if(InpEnableLossReversal && lastDir != 0) {
+               bool withinLimits = true;
+               if(InpMaxReverseLossesPerDay > 0 && m_reversal_losses_today >= InpMaxReverseLossesPerDay)
+                  withinLimits = false;
+               if(InpMaxTradesPerDay > 0 && m_trades_today >= InpMaxTradesPerDay)
+                  withinLimits = false;
+
+               if(withinLimits) {
+                  m_reversal_pending     = true;
+                  m_reversal_dir         = -lastDir; // opposite direction
+                  m_last_loss_close_time = TimeCurrent();
+                  Print("Loss-reversal armed: dir=", (m_reversal_dir > 0) ? "BUY" : "SELL",
+                        " after loss $", DoubleToString(profit, 2),
+                        " revLosses=", m_reversal_losses_today,
+                        "/", InpMaxReverseLossesPerDay);
+               } else {
+                  m_reversal_pending = false;
+                  Print("Loss-reversal skipped: daily limit reached (",
+                        "revLosses=", m_reversal_losses_today,
+                        " trades=", m_trades_today, ")");
+               }
+            }
+         } else {
+            // Winning close -- reset reversal state
+            m_reversal_pending = false;
+         }
+         m_last_was_reversal = false;
          SaveState();
-      }
-      if(n == 0) {
-         m_first_open_time = 0;
-         m_reverse_done    = false;
       }
       m_had_pos = (n > 0);
    }
 
-   bool NewBarSinceLoss() {
-      datetime t = m_mart.LastLossTime();
-      if(t == 0) return true;
-      return (iBarShift(Symbol(), PERIOD_M1, t) >= 1);
-   }
+   // v10.13: Event-driven loss-reversal entry.
+   // Fires once after a losing close, with optional delay and confirmation.
+   // FIFO/netting compatible: waits for CountPositions() == 0.
+   void ManageReverseEntry() {
+      if(!InpEnableLossReversal || !InpEnableTrading) return;
+      if(!m_reversal_pending)                         return;
+      if(m_exec.CountPositions() != 0)               return; // wait for flat
+      if(!TradingWindowOpen())                        return;
+      if(!m_spread.SpreadOK())                        return;
 
-   // v10.10: build the market snapshot for the centralized re-entry decision
-   void BuildReentryContext(REENTRY_CONTEXT &ctx) {
-      ctx.atr_pips          = m_risk.AtrPips();
-      ctx.adx               = iADX(Symbol(), PERIOD_M1, InpMartADXPeriod, PRICE_CLOSE, MODE_MAIN, 1);
-      ctx.price             = Bid;
-      ctx.candle_dir        = m_candle_valid ? m_candle_engine.SignalDirection(m_candle) : 0;
-      ctx.ppm_zone          = m_ppm_valid    ? (int)m_ppm.zone : -1;
-      ctx.new_bar_since_loss = NewBarSinceLoss();
-   }
+      // Delay gate
+      if(TimeCurrent() - m_last_loss_close_time < InpLossReversalDelaySec) return;
 
-   void ManageEntries(bool allowFresh) {
-      if(!InpEnableTrading)              return;
-      if(m_exec.CountPositions() > 0)   return;
-      if(!TradingWindowOpen())           return;
-      if(m_mart.EntryPaused())           return; // consecutive-loss limiter gates ALL entries
-      if(!m_spread.SpreadOK())           return;
-      if(!EquityGuardOK())               return;
-
-      // --- martingale re-entry path ---
-      if(m_mart.CanReenter()) {
-         int reDir = m_mart.ReentryDir();
-         if(reDir == 0) { m_mart.ResetCycle(); return; }
-
-         REENTRY_CONTEXT ctx;
-         BuildReentryContext(ctx);
-         if(!m_mart.ReentryAllowed(ctx)) return;
-         if(!m_volume.Ok())              return;
-
-         double lots = m_mart.ReentryLots(InpBaseLots);
-         if(m_exec.Open(reDir, lots, m_risk, m_vsl, m_spread.EffSlippage())) {
-            m_mart.OnReentry(reDir, lots);
-            SaveState();
-         }
+      // Daily limit check
+      if(InpMaxReverseLossesPerDay > 0 && m_reversal_losses_today >= InpMaxReverseLossesPerDay) {
+         m_reversal_pending = false;
+         return;
+      }
+      if(InpMaxTradesPerDay > 0 && m_trades_today >= InpMaxTradesPerDay) {
+         m_reversal_pending = false;
          return;
       }
 
-      // --- fresh entry path ---
+      // Confirmation gate (reuses ENUM_MART_CONFIRM)
+      if(!ReverseConfirmationOK()) return;
+
+      // Execute the reverse entry
+      double lots = (InpReverseLots > 0.0)
+                       ? NormalizeLots(InpReverseLots)
+                       : NormalizeLots(InpBaseLots);
+      if(m_exec.Open(m_reversal_dir, lots, m_risk, m_vsl, m_spread.EffSlippage())) {
+         m_reversal_pending  = false;
+         m_last_was_reversal = true;
+         m_trades_today++;
+         Print("Loss-reversal fired: dir=", (m_reversal_dir > 0) ? "BUY" : "SELL",
+               " lots=", DoubleToString(lots, 2),
+               " trades=", m_trades_today);
+         SaveState();
+      }
+   }
+
+   // Check reversal confirmation gate (candle/PPM filter)
+   bool ReverseConfirmationOK() {
+      if(InpReverseConfirm == MART_CONFIRM_NONE) return true;
+
+      bool candleOk = false;
+      if(m_candle_valid) {
+         int sigDir = m_candle_engine.SignalDirection(m_candle);
+         candleOk = (sigDir != 0 && sigDir == m_reversal_dir);
+      }
+      bool ppmOk = (m_ppm_valid && m_ppm.zone >= PPM_ZONE_MEDIUM);
+
+      switch(InpReverseConfirm) {
+         case MART_CONFIRM_CANDLE: return candleOk;
+         case MART_CONFIRM_PPM:    return ppmOk;
+         case MART_CONFIRM_EITHER: return (candleOk || ppmOk);
+         case MART_CONFIRM_BOTH:   return (candleOk && ppmOk);
+      }
+      return false;
+   }
+
+   // v10.13: Fresh signal entry only -- no martingale re-entry path.
+   void ManageEntries(bool allowFresh) {
+      if(!InpEnableTrading)              return;
+      if(m_exec.CountPositions() > 0)   return; // single-position invariant
+      if(!TradingWindowOpen())           return;
+      if(!m_spread.SpreadOK())           return;
+      if(!EquityGuardOK())               return;
+
+      // Skip fresh entry if a reversal is pending (let reversal fire first)
+      if(m_reversal_pending)             return;
+
+      // Daily trade limit
+      if(InpMaxTradesPerDay > 0 && m_trades_today >= InpMaxTradesPerDay) return;
+
+      // --- fresh entry path (signal-only, no martingale) ---
       if(!allowFresh || !m_candle_valid || !m_ppm_valid) return;
       if(m_ppm.zone < PPM_ZONE_MEDIUM)                   return;
       if(!m_volume.Ok())                                  return;
@@ -1487,36 +1314,14 @@ private:
 
       double lots = NormalizeLots(InpBaseLots);
       if(m_exec.Open(dir, lots, m_risk, m_vsl, m_spread.EffSlippage())) {
-         m_mart.OnFreshEntry(dir, lots);
-         m_first_open_time = TimeCurrent();
-         m_first_dir       = dir;
-         m_reverse_done    = false;
-         SaveState();
-      }
-   }
-
-   // Time-based reverse leg: 1 min (InpReverseDelaySec) after the first
-   // position opens, open an opposite-direction position with no gates
-   // (MART_CONFIRM_NONE semantics). Independent of the martingale path.
-   void ManageReverseEntry() {
-      if(!InpReverseAfterMin || !InpEnableTrading) return;
-      if(m_reverse_done)                           return;
-      if(m_first_open_time == 0)                   return;
-      if(m_exec.CountPositions() != 1)             return;
-      if(TimeCurrent() - m_first_open_time < InpReverseDelaySec) return;
-
-      int    revDir = -m_first_dir;
-      double lots   = (InpReverseLots > 0.0)
-                         ? NormalizeLots(InpReverseLots)
-                         : NormalizeLots(InpBaseLots);
-      if(m_exec.Open(revDir, lots, m_risk, m_vsl, m_spread.EffSlippage())) {
-         m_reverse_done = true;
+         m_last_was_reversal = false;
+         m_trades_today++;
          SaveState();
       }
    }
 
    void UpdateComment() {
-      string msg = "=== OneMinuteMan v10.12 ===\n";
+      string msg = "=== OneMinuteMan v10.13 (no-mart) ===\n";
       msg += StringFormat("Symbol:%-6s  Engines:M1 (forced)  Chart:%s\n", Symbol(), TFLabel());
       msg += "--- Range ---\n";
       msg += StringFormat("High:%.5f  Low:%.5f  Range:%.5f\n",
@@ -1532,32 +1337,29 @@ private:
                           InpEnableTrading ? "ON" : "OFF",
                           (int)((Ask - Bid) / Point), m_spread.EffMaxSpread(),
                           AccountEquity(), m_guard.DrawdownPct());
-      msg += StringFormat("Open:%d  Mart:%d/%d %s\n",
+      msg += StringFormat("Open:%d  Trades:%d%s\n",
                           m_exec.CountPositions(),
-                          m_mart.Step(), m_mart.MaxSteps(),
-                          m_mart.AwaitReentry() ? "[AWAIT]" : "");
-      msg += StringFormat("ConsecLosses:%d%s%s\n",
-                          m_mart.ConsecLosses(),
-                          m_mart.EntryPaused()
-                             ? StringFormat("  PAUSED until %s",
-                                TimeToString(m_mart.PauseUntil(), TIME_MINUTES))
-                             : "",
-                          (m_mart.AwaitReentry() && StringLen(m_mart.BlockReason()) > 0)
-                             ? "  Block:" + m_mart.BlockReason() : "");
+                          m_trades_today,
+                          (InpMaxTradesPerDay > 0)
+                             ? StringFormat("/%d", InpMaxTradesPerDay) : "");
+      // Loss-reversal status
+      msg += StringFormat("Reversal:%s  Confirm:%s\n",
+                          InpEnableLossReversal ? "ON" : "OFF",
+                          ConfirmName(InpReverseConfirm));
+      if(m_reversal_pending) {
+         int delayRemaining = (int)(InpLossReversalDelaySec - (TimeCurrent() - m_last_loss_close_time));
+         if(delayRemaining < 0) delayRemaining = 0;
+         msg += StringFormat("  PENDING %s in %d s\n",
+                             (m_reversal_dir > 0) ? "BUY" : "SELL",
+                             delayRemaining);
+      }
+      msg += StringFormat("RevLosses:%d%s\n",
+                          m_reversal_losses_today,
+                          (InpMaxReverseLossesPerDay > 0)
+                             ? StringFormat("/%d", InpMaxReverseLossesPerDay) : "");
       msg += StringFormat("Session: %s  HideSL:%s  VSLs:%d\n",
                           TradingWindowOpen() ? "OPEN" : "CLOSED",
                           InpHideSL ? "ON" : "OFF", m_vsl.Count());
-      {
-         int revIn = -1;
-         if(InpReverseAfterMin && m_first_open_time != 0 && !m_reverse_done) {
-            revIn = (int)(InpReverseDelaySec - (TimeCurrent() - m_first_open_time));
-            if(revIn < 0) revIn = 0;
-         }
-         msg += StringFormat("Reverse:%s done=%s%s\n",
-                             InpReverseAfterMin ? "ON" : "OFF",
-                             m_reverse_done ? "yes" : "no",
-                             revIn >= 0 ? StringFormat(" in %d s", revIn) : "");
-      }
       if(m_halted)
          msg += StringFormat("HALTED until: %s (GMT)\n",
                              TimeToString(m_halt_until, TIME_MINUTES));
@@ -1573,30 +1375,28 @@ public:
       m_halted       = false;
       m_halt_until   = 0;
       m_last_bar_time = 0;
-      m_first_open_time = 0;
-      m_first_dir       = 0;
-      m_reverse_done    = false;
+
+      // v10.13 loss-reversal state init
+      m_reversal_pending      = false;
+      m_reversal_dir          = 0;
+      m_last_loss_close_time  = 0;
+      m_reversal_losses_today = 0;
+      m_trades_today          = 0;
+      m_last_was_reversal     = false;
 
       // --- input validation ---
       if(InpWindowSize < 60 || InpWindowSize > 50000)
          { Print("Error: InpWindowSize must be 60-50000"); return INIT_PARAMETERS_INCORRECT; }
       if(InpBaseLots <= 0.0)
          { Print("Error: InpBaseLots must be > 0"); return INIT_PARAMETERS_INCORRECT; }
-      if(InpMartMult <= 0.0)
-         { Print("Error: InpMartMult must be > 0"); return INIT_PARAMETERS_INCORRECT; }
       if(InpSprEmaAlpha <= 0.0 || InpSprEmaAlpha > 1.0)
          { Print("Error: InpSprEmaAlpha must be in (0,1]"); return INIT_PARAMETERS_INCORRECT; }
-      if(InpMartCooldownBars < 0)
-         { Print("Error: InpMartCooldownBars must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
-      if(InpMartMaxSteps < 0)
-         { Print("Error: InpMartMaxSteps must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
-      if(InpMaxConsecLosses > 0 && InpConsecLossPauseMin < 1)
-         { Print("Error: InpConsecLossPauseMin must be >= 1"); return INIT_PARAMETERS_INCORRECT; }
-      if(InpMartAtrLowPips > 0 && InpMartAtrHighPips > 0 &&
-         InpMartAtrHighPips < InpMartAtrLowPips)
-         { Print("Error: InpMartAtrHighPips must be >= InpMartAtrLowPips"); return INIT_PARAMETERS_INCORRECT; }
-      if(InpMartMinAtrDist < 0.0)
-         { Print("Error: InpMartMinAtrDist must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
+      if(InpLossReversalDelaySec < 0)
+         { Print("Error: InpLossReversalDelaySec must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
+      if(InpMaxReverseLossesPerDay < 0)
+         { Print("Error: InpMaxReverseLossesPerDay must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
+      if(InpMaxTradesPerDay < 0)
+         { Print("Error: InpMaxTradesPerDay must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
 
       // --- component initialization ---
       m_spread.Init(InpSprEmaAlpha, InpMaxSpreadMult, InpSlippageMult,
@@ -1614,12 +1414,6 @@ public:
                   InpMinRiskPips, InpSL_Pips, InpTP_Pips, InpTrailStart, InpTrailStep);
       m_vsl.Init(InpHideSL);
       m_trailing.Init(InpHideSL, InpBE_LockPips);
-      m_mart.Init(InpUseMartingale, InpMartMult,
-                  InpMartMaxSteps, InpMartCooldownBars,
-                  InpMartCooldownSchedule, InpMartMultSchedule,
-                  InpMaxConsecLosses, InpConsecLossPauseMin,
-                  InpMartMaxADX, InpMartMinAtrDist, InpMartConfirm,
-                  InpMartAtrLowPips, InpMartAtrHighPips);
       m_exec.Init(InpMagic, InpHideSL, InpUseSafetySL, InpSafetySLMult, InpBE_LockPips);
       m_store.Init(InpMagic);
 
@@ -1628,80 +1422,43 @@ public:
          return INIT_FAILED;
       }
 
-      // --- optional ATR auto-calibration ---
-      // ATR thresholds are derived from live M1 percentiles (applied).
-      // ADX suggestion is printed only; apply manually after demo validation.
-      if(InpAutoCalibrateMartAtr) {
-         if(Bars < 60) {
-            Print("Auto-calibrate warning: fewer than 60 bars available; keeping manual ATR thresholds.");
-         } else {
-            int    sampleCount = (int)MathMin(500, Bars - 1);
-            double pipSize     = PipSize();
-            double atrValues[];
-            double adxValues[];
-            ArrayResize(atrValues, sampleCount);
-            ArrayResize(adxValues, sampleCount);
-            int atrCount = 0;
-            int adxCount = 0;
-
-            for(int i = 1; i <= sampleCount; i++) {
-               double atrPips = iATR(Symbol(), PERIOD_M1, InpAtrPeriod, i) / pipSize;
-               if(atrPips > 0.0) atrValues[atrCount++] = atrPips;
-
-               double adx = iADX(Symbol(), PERIOD_M1, InpMartADXPeriod,
-                                 PRICE_CLOSE, MODE_MAIN, i);
-               if(adx > 0.0) adxValues[adxCount++] = adx;
-            }
-
-            if(atrCount < 60) {
-               Print("Auto-calibrate warning: fewer than 60 valid M1 ATR samples; keeping manual ATR thresholds.");
-            } else {
-               ArrayResize(atrValues, atrCount);
-               ArraySort(atrValues, WHOLE_ARRAY, 0, MODE_ASCEND);
-               int lowIndex  = (int)MathRound((atrCount - 1) * 0.50);
-               int highIndex = (int)MathRound((atrCount - 1) * 0.85);
-               int lowPips   = (int)MathRound(atrValues[lowIndex]);
-               int highPips  = (int)MathRound(atrValues[highIndex]);
-               if(highPips < lowPips) highPips = lowPips;
-               m_mart.SetAtrThresholds(lowPips, highPips);
-
-               double adxSuggest = 0.0;
-               if(adxCount > 0) {
-                  ArrayResize(adxValues, adxCount);
-                  ArraySort(adxValues, WHOLE_ARRAY, 0, MODE_ASCEND);
-                  double percentile = 0.40;
-                  int    adxIndex   = (int)MathRound((adxCount - 1) * percentile);
-                  adxSuggest        = NormalizeDouble(adxValues[adxIndex], 1);
-               }
-
-               Print("Auto-calibrate: ATR thresholds APPLIED low=", lowPips,
-                     " high=", highPips,
-                     " pips; suggested InpMartMaxADX=", adxSuggest,
-                     " (not applied; set manually after demo validation)");
-            }
-         }
-      }
-
       // --- restore persisted state ---
       bool     halted    = false;
       datetime haltUntil = 0;
       double   baseline  = 0.0;
       int      dayStamp  = 0;
-      if(m_store.Load(m_mart, m_vsl, halted, haltUntil, baseline, dayStamp)) {
+      int      revLosses = 0;
+      int      trades    = 0;
+      datetime llct      = 0;
+      bool     revPend   = false;
+      int      revDir    = 0;
+
+      if(m_store.Load(m_vsl, halted, haltUntil, baseline, dayStamp,
+                      revLosses, trades, llct, revPend, revDir)) {
          int today = m_clock.LocalDayStamp();
          if(dayStamp == today && baseline > 0.0) {
             m_guard.SetBaseline(baseline, dayStamp);
+            m_reversal_losses_today = revLosses;
+            m_trades_today          = trades;
+            m_last_loss_close_time  = llct;
+            m_reversal_pending      = revPend;
+            m_reversal_dir          = revDir;
             if(halted && TimeGMT() < haltUntil) {
                m_halted     = true;
                m_halt_until = haltUntil;
                Print("Restored active halt until ", TimeToString(haltUntil), " GMT");
             }
          } else {
+            // New day -- reset daily counters
             m_guard.ResetBaseline(today);
+            m_reversal_losses_today = 0;
+            m_trades_today          = 0;
+            m_reversal_pending      = false;
          }
-         Print("State recovered: MartStep=", m_mart.Step(),
-               " VSLs=", m_vsl.Count(),
-               " AwaitReentry=", m_mart.AwaitReentry() ? "yes" : "no");
+         Print("State recovered (OMM5): VSLs=", m_vsl.Count(),
+               " RevPending=", m_reversal_pending ? "yes" : "no",
+               " RevLosses=", m_reversal_losses_today,
+               " Trades=", m_trades_today);
       } else {
          m_guard.ResetBaseline(m_clock.LocalDayStamp());
       }
@@ -1712,7 +1469,7 @@ public:
          { Print("Error: Timer failed"); return INIT_FAILED; }
 
       m_initialized = true;
-      Print("OneMinuteMan v10.12 initialized successfully.");
+      Print("OneMinuteMan v10.13 (no-mart) initialized successfully.");
       return INIT_SUCCEEDED;
    }
 
@@ -1722,6 +1479,9 @@ public:
       if(m_initialized) SaveState(); // never clobber good state from a failed init
    }
 
+   // Timer path: SL enforcement, trailing, range sampling, reverse entry.
+   // Conflict resolution policy (CR6): Timer always runs SL enforcement first.
+   // Order actions are guarded by CountPositions() checks.
    void OnTimerHandler() {
       if(!m_initialized) return;
       RefreshRates();
@@ -1733,7 +1493,12 @@ public:
       if(m_ppm_engine.Calc(tmp)) { m_ppm = tmp; m_ppm_valid = true; }
 
       // Roll the drawdown baseline on local-day change even without ticks
-      m_guard.RollDayIfNeeded(m_clock.LocalDayStamp());
+      if(m_guard.RollDayIfNeeded(m_clock.LocalDayStamp())) {
+         // New day: reset daily counters
+         m_reversal_losses_today = 0;
+         m_trades_today          = 0;
+         m_reversal_pending      = false;
+      }
 
       m_trailing.Manage(m_risk, m_vsl, InpMagic);
       m_vsl.Enforce(m_spread.EffSlippage());
@@ -1741,6 +1506,9 @@ public:
       UpdateComment();
    }
 
+   // Tick path: candle recognition, signal evaluation, trade state tracking.
+   // Conflict resolution policy (CR6): If timer just closed a position,
+   // UpdateTradeState() will detect it and proceed safely.
    void OnTickHandler() {
       if(!m_initialized) return;
       bool newBar = IsNewBar();
@@ -1753,7 +1521,11 @@ public:
          }
       }
 
-      m_guard.RollDayIfNeeded(m_clock.LocalDayStamp());
+      if(m_guard.RollDayIfNeeded(m_clock.LocalDayStamp())) {
+         m_reversal_losses_today = 0;
+         m_trades_today          = 0;
+         m_reversal_pending      = false;
+      }
       UpdateTradeState();
 
       if(m_exec.CountPositions() > 0) {
@@ -1774,7 +1546,7 @@ public:
 };
 
 //==================================================================
-// SECTION 17 -- MT4 EVENT HANDLERS (delegate to the Facade)
+// SECTION 16 -- MT4 EVENT HANDLERS (delegate to the Facade)
 //==================================================================
 CExpertAdvisor g_ea;
 
