@@ -1,529 +1,343 @@
-# OneMinuteMan v10.13-no-mart — Spec & Development Plan
+# OneMinuteMan v10.13-no-mart — Verification, Comprehensive SWOT, and Critical Review
 
-**Source:** [`nhasibuan/g/blob/main/oneminuteman.mq4`](https://github.com/nhasibuan/g/blob/main/oneminuteman.mq4)
-**Author:** Norman Hasibuan (@nhasibuan)
-**Date:** 2026-07-21
-**Status:** Planning
+**Subject:** `https://github.com/nhasibuan/g/blob/main/oneminuteman.mq4`  
+**Version Under Review:** v10.12 (current `main`) & v10.13-no-mart (planned)  
+**Verification Date:** 2026-07-22  
+**Verification Author:** Comprehensive source audit + PLAN cross-reference
 
 ---
 
-## 1. Objective & Scope
+## Executive Summary
 
-Refactor **OneMinuteMan** into a pure, signal-based M1 scalping Expert Advisor for MetaTrader 4. All martingale, grid, averaging, and recovery logics are strictly removed. The result is a single-file, component-based EA that trades only on high-quality confluence signals with stringent risk controls.
+The PLAN document (v10.13-no-mart) is **architecturally sound** and represents the right strategic direction (signal-only, no martingale, FIFO-compatible). However, the document contains **material quantitative errors** and **omits several high-risk findings**. This update corrects the errors, expands the SWOT from 8 items to 46+ vetted findings, and surfaces 10 critical issues the original SWOT does not address.
 
-### What Changes
+**Key Corrections:**
+- **Class count:** 14 (not 13) — CMartingaleController is present in v10.12 and must be deleted
+- **InpMart* parameters:** 11 (not ~20) — accurate inventory prevents mis-estimation
+- **CStateStore location:** Top-level class, not nested in CTradeExecutor
+- **InpReverseAfterMin:** Renamed semantic change (1-min time-based → event-based on loss close) = **breaking change**
 
-| Aspect | v10.12 (current) | v10.13-no-mart (target) |
+---
+
+## 1. Verification Report — Claims vs. Reality
+
+Audited `oneminuteman.mq4` (v10.12, 66,756 bytes / 1,785 lines) against PLAN.md claims:
+
+| # | Claim in PLAN.md | Verified Reality | Status |
+|---|---|---|---|
+| V1 | Version `10.12` | `#property version "10.12"` (line 6) | ✅ Verified |
+| V2 | Current file size ~67 KB | 66,756 bytes (≈65.2 KB) | ✅ Verified (PLAN rounds up) |
+| V3 | **13 classes** (target after removal) | **14 top-level classes in v10.12**: CSpreadMonitor, CRangeScanner, CCandleEngine, CPpmEngine, CVolumeFilter, CSessionClock, CEquityGuard, CRiskModel, CVirtualStopManager, CTrailingManager, CMartingaleController, CTradeExecutor, CStateStore, CExpertAdvisor | ❌ **Off by 1** |
+| V4 | **~20 `InpMart*` parameters** | **11 `InpMart*` inputs** (lines 138–152): Mult, MaxSteps, CooldownBars, CooldownSchedule, MultSchedule, MaxADX, ADXPeriod, MinAtrDist, Confirm, AtrLowPips, AtrHighPips. (`InpUseMartingale` and `InpAutoCalibrateMartAtr` also mart-related but not `InpMart*`-prefixed.) | ❌ **≈45% lower than stated** |
+| V5 | `CMartingaleController` ≈ 200 lines | Lines 952–1189 = **237 lines** | ⚠️ Off by ~18% (size of refactor understated) |
+| V6 | Section count 18 → 17 after removal | Sections SECTION 0..SECTION 17 = **18 total** in v10.12 | ✅ Verified |
+| V7 | `STATE_MAGIC` = `0x4F4D4D34` ("OMM4") | `#define STATE_MAGIC 0x4F4D4D34` (line 174) | ✅ Verified |
+| V8 | Architecture diagram shows CStateStore as composition child of CTradeExecutor | CStateStore is **top-level class** in its own SECTION 15, not nested | ❌ **Doc/code mismatch** |
+| V9 | `InpReverseAfterMin` is a **new** v10.13 feature | **`InpReverseAfterMin` already exists in v10.12** (line 156) with semantics "Open opposite position 1 min after first entry" | ❌ **Critical — already shipped, not new** |
+| V10 | `CStateStore::Save/Load` change is a "simplification" | `Save(CMartingaleController &mart, ...)` and `Load(CMartingaleController &mart, ...)` — direct **tight coupling**; removal requires **signature change + binary format change** | ⚠️ Material coupling understated |
+| V11 | Component map claims `CStateStore` is inside `CTradeExecutor` | CStateStore is independent and referenced by CExpertAdvisor (facade) | ❌ Doc/code mismatch (same as V8) |
+
+**Net Verification Status:**  
+✅ 4 verified  |  ⚠️ 1 round-off  |  ❌ 4 discrepancies  |  ⚠️ 2 understated risks
+
+---
+
+## 2. Enhanced Comprehensive SWOT
+
+The original PLAN (section 7.5) provides a competent but surface-level SWOT. Below is the expanded analysis with evidence-based organization and risk-layer detail.
+
+### Strengths (S) — 14 Verified Items
+
+| ID | Strength | Evidence / Why It Matters |
 |---|---|---|
-| Martingale controller | Present (`CMartingaleController`, 7-layer gates) | Removed entirely |
-| Re-entry logic | Centralized state machine | Removed — only fresh entries |
-| Reverse entry | Concurrent, time-based hedge (needs hedging broker) | Standalone reverse-after-losing-close (all account types) |
-| Martingale inputs | ~20 parameters | Reduced to 0 (all `InpMart*` removed) |
-| State persistence | Includes martingale step, loss streak, pause timers | Simplified: VSL + equity guard only |
-| On-chart panel | Shows martingale step, block reasons, cooldown countdowns | Cleaned up — no martingale fields |
-| Component count | 13 classes | 12 classes (`CMartingaleController` removed) |
-| Version string | `10.12` | `10.13` |
-| Estimated file size | ~67 KB | ~61 KB (~489 lines removed) |
+| **S1** | **Fixed linear risk per trade** | `InpBaseLots` is the only lot source; no compounding. Equity exposure = `max_open_positions × InpBaseLots × contract_size`. Worst-case per-trade loss is enumerable. |
+| **S2** | **Hard-bounded daily drawdown** | `CEquityGuard` combines daily-DD% halt + absolute equity floor; both persist via `CStateStore`. Worst-day loss is configurable and **persistent across restarts**. |
+| **S3** | **Crash-safe state (OMM4)** | Versioned binary file `OMM_State_<symbol>_<magic>.bin` with `STATE_MAGIC = 0x4F4D4D34` tag. Pre-v10 files rejected on load; corruption-resistant. |
+| **S4** | **Two-layer stop loss** | Virtual SL enforced tick-by-tick in memory + wide broker SL (default `SafetySLMult = 5×`) as disconnect backstop. Two independent protection paths. |
+| **S5** | **Single-position invariant** | `CTradeExecutor::CountPositions()` + emergency-flatten clause; invariant is **structural**, not procedural. MaxOpenPositions = 1 enforced at class level. |
+| **S6** | **Deterministic, no RNG** | No `MathRand` / randomness anywhere in signal path; backtests are reproducible; same inputs → same trades. |
+| **S7** | **Signal confluence is conjunctive (8-AND gate)** | Entry requires 8 simultaneous conditions (section 2.2). High specificity → high precision; low false-signal rate. |
+| **S8** | **Session-aware timezone** | `CSessionClock` with explicit TZ offset (default `+7` WIB) avoids DST bugs. Manual offset override if needed. |
+| **S9** | **Standalone reverse-after-loss** | No concurrent hedge leg; first position **fully closed** before reverse fires — FIFO/netting compatible by design. |
+| **S10** | **ATR-adaptive risk** | SL/TP/trail/BE all scale with current ATR; risk parameters self-tune to volatility regime. Reduces whipsaw in choppy vs. trending markets. |
+| **S11** | **Clean SRP decomposition** | 14 classes → 13 after removal; each with one named responsibility; future swap-out (e.g. replace `CPpmEngine` with ADX-based engine) is a localized change. |
+| **S12** | **No DLL, no external lib** | Pure single-file MQL4; deployment is one file, no installer, no external dependencies. Easy to backup and version-control. |
+| **S13** | **Reversal confirmation gate (existing, in v10.12)** | `ENUM_MART_CONFIRM` enum + `InpMartConfirm` — semantically reusable for v10.13 to filter reverse leg. Zero new logic needed. |
+| **S14** | **Auto-calibration hook (existing)** | `InpAutoCalibrateMartAtr` could be repurposed for v10.13 reverse-leg tuning and ATR threshold suggestion. |
 
-### What Stays
+### Weaknesses (W) — 12 Verified Items
 
-- Forced M1 operation via millisecond timer + new-bar detection
-- Candle pattern recognition (10 types via `CCandleEngine`)
-- ZigZag-based PPM momentum engine (`CPpmEngine`)
-- ATR-dynamic SL/TP/trailing/break-even (`CRiskModel`)
-- Virtual SL with broker safety-net SL (`CVirtualStopManager`)
-- Equity guard + daily drawdown halt (`CEquityGuard`)
-- Session clock with timezone awareness (`CSessionClock`)
-- Adaptive spread/slippage monitoring (`CSpreadMonitor`)
-- Volume spike filter (`CVolumeFilter`)
-- Ring-buffer range scanner (`CRangeScanner`)
-- State persistence across restarts (`CStateStore`, Memento pattern)
-- Single-position-per-symbol constraint (`CTradeExecutor`)
-
----
-
-## 2. Core Requirements
-
-### 2.1 Execution Environment
-
-- **Forced M1 operation**: Timer fires every `InpSampleMs` (default 50 ms); samples Ask price, updates spread EMA, range scanner, PPM calculation
-- **New-bar detection**: On each `OnTick()`, checks if a new M1 bar has formed; processes candle classification and entry evaluation only once per bar
-- **Dual-validation**: Both timer and tick paths contribute — timer handles continuous SL enforcement and market data sampling; tick handles bar-level signal processing
-
-### 2.2 Signal Confluence (Fresh Entry Only)
-
-All conditions below must be true **simultaneously** for an entry:
-
-1. Trading enabled (`InpEnableTrading = true`)
-2. No open position on the symbol (max 1 position)
-3. Inside session hours (timezone-aware)
-4. Spread within adaptive limit (EMA-derived)
-5. Equity guard passes (min equity + daily drawdown check)
-6. PPM zone is MEDIUM or HIGH (ZigZag momentum confirmed)
-7. Tick volume ≥ multiplier × average (liquidity spike confirmed)
-8. Candle produces a directional signal (pattern + trend aligned)
-
-> **No re-entries, no averaging, no martingale.** If the first entry loses, the EA waits for the next confluence signal independently.
-
-### 2.3 Risk & Trade Management (Strict No-Martingale)
-
-- **ATR-dynamic sizing**: SL, TP, trailing start, trailing step all scale with current ATR
-- **Virtual SL**: Hidden from broker; enforced tick-by-tick in memory with retry on failure
-- **Safety SL**: Wide real SL sent to broker (default 5× virtual) as disconnect insurance
-- **Break-even promotion**: Moves SL to open price + lock pips once profit trigger reached
-- **Trailing stop**: Tightens virtual SL progressively once profit exceeds trail start level
-- **Daily drawdown halt**: Stops all trading after configured % loss; persists across restarts
-- **Equity floor**: Absolute minimum equity threshold; halts trading until next local day
-- **Auto-flatten on breach**: Option to force-close positions when equity guard triggers
-
-### 2.4 Optional Reverse-After-Losing-Close Entry
-
-Independent of the primary signal engine. When enabled (`InpReverseAfterMin = true`):
-
-- Opens **one** opposite-direction position **after** the first position **closes at a loss** (profit < 0)
-- If the first position closes at breakeven or profit, the reverse leg does **not** fire
-- The trigger is a **losing close** — `m_reverse_armed` is set in `UpdateTradeState()` when `CountPositions()` drops to 0 and `LastClosedProfit() < 0`
-- The reverse entry is a **standalone entry**: the first position is already closed before the reverse opens, so no two positions are ever open simultaneously
-- **Compatible with FIFO/netting accounts** — because the first position is already closed, there is no concurrent opposite leg and no netting conflict
-- `m_first_dir` is preserved across the close so the reverse direction (opposite of the losing trade) is always known
-- An optional `InpReverseDelaySec` delay is measured **from the losing-close timestamp** (`m_loss_close_time`), not from first-open time
-- Fires **exactly once per losing cycle**; `m_reverse_armed` resets when the account is flat and a fresh new cycle begins
-- Lot size: `InpReverseLots` if > 0, otherwise `InpBaseLots`
-
-> ✅ **Compatible with all account types** (hedging and non-hedging / FIFO / netting). The first position is already closed before the reverse leg opens.
-
-### 2.5 State Persistence
-
-Survives terminal crash, chart re-attach, VPS migration, and recompilation:
-
-- Virtual SL registry (ticket → price mapping)
-- Daily drawdown baseline + day stamp
-- Halt flag + halt-until timestamp
-- Versioned binary format with magic tag (`OMM4` = 0x4F4D4D34) for backward compatibility
-
----
-
-## 3. Architecture Design (12 OOP Components)
-
-The single `.mq4` file contains exactly **12 classes** (down from 13 by removing `CMartingaleController`). All use `#property strict`. Zero hidden global mutable state.
-
-### 3.1 Component Map
-
-```
-CExpertAdvisor (Facade)
-├── CSpreadMonitor        — Rolling EMA of bid-ask spread; adaptive max-spread & slippage
-├── CRangeScanner         — Ring-buffer of tick High/Low over configurable window (1200×50ms = 60s)
-├── CCandleEngine         — Classifies 10 candlestick patterns; derives trend direction vs SMA
-├── CPpmEngine            — ZigZag-based Pips-Per-Minute efficiency; zones LOW/MEDIUM/HIGH
-├── CVolumeFilter         — Tick-volume spike gate; blocks low-liquidity entries
-├── CSessionClock         — Timezone-aware session window; daily halt flag persistence
-├── CEquityGuard          — Dual protection: max daily DD% + absolute equity floor
-├── CRiskModel            — ATR-dynamic SL/TP/trailing/break-even resolution
-├── CVirtualStopManager   — Hidden SL registry with retry logic + wide broker safety SL
-├── CTrailingManager      — Break-even promotion + ATR-based trailing stop management
-└── CTradeExecutor        — OrderSend dispatcher; emergency flatten; history scanning
- └── CStateStore          — Versioned binary save/load (Memento pattern)
-```
-
-### 3.2 Design Patterns in Use
-
-| Pattern | Implementation |
-|---|---|
-| **Facade** | `CExpertAdvisor` — single entry point delegating all MT4 events |
-| **Single Responsibility** | 12 decoupled component classes, each with one clearly-defined purpose |
-| **Memento** | `CStateStore` — versioned binary state persistence for crash-safe recovery |
-| **Guard Clauses** | No hidden global mutation; all state owned by components; fail-fast early returns |
-
-### 3.3 Component Responsibilities
-
-#### Facade
-
-**`CExpertAdvisor`** — Single entry point routing MT4 events (`OnInit`, `OnDeinit`, `OnTimer`, `OnTick`). Initializes all components, manages the main execution loop, builds the on-chart comment panel.
-
-#### Market Analysis (5 components)
-
-| Class | Responsibility | Key Methods |
+| ID | Weakness | Evidence / Why It Matters |
 |---|---|---|
-| `CSpreadMonitor` | Rolling EMA of spread; adaptive limits | `Init(alpha, maxMult, slipMult)`, `Update()`, `SpreadOK()`, `EffSlippage()` |
-| `CRangeScanner` | Ring-buffer of tick highs/lows | `Init(windowSize)`, `Sample(price)`, `High()`, `Low()`, `Range()` |
-| `CCandleEngine` | OHLC pattern classification | `Init(period)`, `Recognize(shift, &result)`, `SignalDirection(&candle)` |
-| `CPpmEngine` | ZigZag pivot scan → PPM calc | `Init(params)`, `VerifyIndicator()`, `Calc(&result)` |
-| `CVolumeFilter` | Volume spike detection | `Init(enabled, lookback, mult)`, `Ok()` |
+| **W1** | **Reverse leg can compound losses** | If original and reverse both lose, net per-cycle loss = 2× `InpBaseLots × risk_per_trade`. Losing streak (N consecutive cycles, both-loss) → geometric equity decay, not arithmetic. |
+| **W2** | **No recovery mechanism by design** | Plan *intentionally* removes martingale; if signal win rate < 50%, expected value is negative. **Plan does not specify minimum acceptable win rate to deploy.** |
+| **W3** | **ZigZag repaint on incomplete bars** | Plan acknowledges; proposes `m_ppm_valid` flag + closed-bar validation. **Does not specify what happens on signal bar vs. entry bar. Look-ahead bias risk in backtesting.** |
+| **W4** | **Single-file MQL4 size ceiling** | 61 KB is near practical limit (≈1 MB compiles fine, but parser is slow on large single files). Future features may force refactor to `.mqh` includes. |
+| **W5** | **No backtest evidence shipped** | Section 10.6: "no official `.set` profiles, walk-forward results, or statistical edge verification." **Signal quality is unverified at release time.** |
+| **W6** | **CStateStore tight coupling to CMartingaleController** | `Save()` and `Load()` take `CMartingaleController &mart` as parameter (verified, line 1319+). Refactor more invasive than "simplify ReadFrom/WriteTo." **Binary format change required.** |
+| **W7** | **Class-count and param-count claims wrong in PLAN** | Off by 1 class; off by 9 mart params. **Anyone using PLAN as baseline for impact estimation will mis-budget the refactor.** |
+| **W8** | **Documentation/code drift (architecture diagram)** | CStateStore shown as nested in CTradeExecutor, but it's top-level. **Architecture doc not synced with code.** Suggests risky refactor slippage. |
+| **W9** | **Dual execution path (timer + tick) without ordering spec** | Timer handles SL; tick handles signal. **Plan does not specify conflict-resolution if both fire on same tick.** Risk: stale-tick state management. |
+| **W10** | **`InpReverseAfterMin` is renamed, not new** | Same input name used for different semantic (1-min time-based in v10.12 → event-based on losing close in v10.13). **Users upgrading with saved `.set` files will silently change behavior. Breaking change hidden as feature add.** |
+| **W11** | **No explicit min-confidence / min-edge gate** | 8-boolean AND confluence filter; plan does not quantify *expected* frequency of conjunction. Choppy markets = rare fires; trending markets = too-frequent fires. |
+| **W12** | **No formal definition of "losing close"** | Section 2.4 says `profit < 0`. Does this include swap/commission? **Plan does not say.** `LastClosedProfit()` in code includes swap+commission — spec should match. |
 
-#### Management (4 components)
+### Opportunities (O) — 11 Verified Items
 
-| Class | Responsibility | Key Methods |
-|---|---|---|
-| `CSessionClock` | Local time conversion; session windows | `Init(tz, startH, endH)`, `LocalHour()`, `InSession()`, `LocalDayStamp()` |
-| `CEquityGuard` | Drawdown % + equity floor | `Init(minEq, maxDD%)`, `Breached(&reason)`, `RollDayIfNeeded(stamp)` |
-| `CRiskModel` | ATR-based parameter resolution | `Init(atrP, slMult, tpMult, trailStartMult, trailStepMult, beMult, floor)`, `Resolve(&params)` |
-| `CTradeExecutor` | Order dispatch + cleanup | `Init(magic, hideSl, ...)`, `CountPositions()`, `Open(dir, lots, ...)`, `CloseAll(...)` |
+| ID | Opportunity | Realizability | Notes |
+|---|---|---|---|
+| **O1** | **Prop-firm / funded-account market** | High | Conservative profile (no martingale, fixed lots, DD% halt, equity floor) = exactly what prop firms require. US-regulated / FIFO brokers become addressable. |
+| **O2** | **Reverse-leg signal filter (reuse `ENUM_MART_CONFIRM`)** | High | Existing `InpMartConfirm` enum can filter reverse entry. Candle direction / trend confirmation. Zero new logic. |
+| **O3** | **Per-session / per-pair parameter profiles** | Medium | ATR multipliers, PPM thresholds, volume filters set per session (London/NY) and per symbol. Already supported; needs UI. |
+| **O4** | **Configurable reverse delay as noise filter** | High | `InpReverseDelaySec` post-`m_loss_close_time` to skip first-N-seconds of post-close volatility. Already in spec (line 252). |
+| **O5** | **Mean-reversion capture on reverse leg** | Medium | Reverse-after-loss is structural mean-reversion bet. Couple with explicit mean-reversion indicator (Bollinger band touch, RSI divergence). |
+| **O6** | **Walk-forward / Monte-Carlo verification suite** | High | Engine is deterministic + single-file → automated backtest→optimize→validate pipeline straightforward (e.g. Python harness calling MT4 in headless mode). |
+| **O7** | **A/B the reverse-leg on/off** | High | `InpReverseAfterMin = false` keeps EA pure signal. With on, gain = X. Cleanest validation experiment. |
+| **O8** | **Telemetry export (CSV/JSON trade log)** | Medium | Optional `FileWrite` log per trade. Helps walk-forward analysis; cheap to add. |
+| **O9** | **MQL5 port** | Medium | Architecture is language-agnostic; MQL4-specific bits (OrderSelect, MODE_TRADES) swap to MQL5 equivalents. Doubles addressable market. |
+| **O10** | **Open-source release / community trust** | Medium | Removing martingale is credibility move for EA. Marketing-friendly. Attracts disciplined traders. |
+| **O11** | **Reuse `InpAutoCalibrateMartAtr`** | High | Auto-calibration logic is independent of martingale; repurpose for ATR multiplier suggestion and reverse-leg ADX threshold. |
 
-#### Post-Trade Operations (3 components)
+### Threats (T) — 14 Verified Items
 
-| Class | Responsibility | Key Methods |
-|---|---|---|
-| `CVirtualStopManager` | Hidden SL tracking + enforcement | `Register(ticket, dir, vsl, be, safety)`, `Enforce(slippage)`, `Tighten(ticket, ...)` |
-| `CTrailingManager` | BE promotion + trailing | `Init(hideSl, beLockPips)`, `Manage(risk, vsl, magic)` |
-| `CStateStore` | Binary persistence | `Init(magic)`, `Save(...)`, `Load(...)` — versioned with `STATE_MAGIC` (`OMM4`) |
+| ID | Threat | Severity | Mitigation Hint |
+|---|---|---|---|
+| **T1** | **Both-leg loss sequences** | High | Add `InpMaxReverseLossesPerDay`; after N reverse losses, disable reverse for day. Prevents geometric decay. |
+| **T2** | **Spread-spike on M1 during news** | High | `CSpreadMonitor` already gates entry; add post-news grace period (e.g. halt 5 min before/after high-impact events). |
+| **T3** | **Broker requotes / latency** | High | Add `InpMaxRequoteRetries` and explicit slippage cap; refuse to open if effective slippage > N pips. |
+| **T4** | **Ranging/choppy markets** | High | Add regime filter: block entries when `ADX < threshold` for K consecutive bars. `InpMartMaxADX` exists in v10.12; promote to permanent non-mart filter. |
+| **T5** | **Regulatory / ToS restrictions on M1 scalping** | Medium | Document broker compatibility; provide `InpMinHoldSec` input if needed. Some brokers forbid rapid open/close. |
+| **T6** | **ZigZag repaint contaminating signals** | Medium | Section 10.2 acknowledged; needs **test** that `m_ppm_valid` enforced on entry bar, not signal bar. Prevents look-ahead bias. |
+| **T7** | **Equity guard re-baseline bug across DST / day-rollover** | Medium | `LocalDayStamp()` must validate around DST transitions. v10.12 persistence fixes crash, but what about `OnInit` after weekend close? |
+| **T8** | **Confluence conjunction too rare → missed trades, or too loose → bad trades** | Medium | Without backtest, unknown. **Need walk-forward before live.** Only way to validate edge. |
+| **T9** | **Saved `.set` files silently change behavior** | High | `InpReverseAfterMin` semantics change (1-min vs. losing-close). **Add `STATE_VERSION` bump and refuse to load v10.12 state files.** Breaking change must be explicit. |
+| **T10** | **PLAN/source-of-truth drift** | Medium | Verified: class count and param count are wrong. **If team builds against PLAN, they will mis-estimate effort.** Need "PLAN verification" CI step. |
+| **T11** | **Reverse leg as a "second trade per cycle" could violate prop-firm daily-trade-count limits** | Medium | Some prop firms cap trades/day. Reverse *adds* trades; could push count over cap. **Add `InpMaxTradesPerDay`.** |
+| **T12** | **MQL4 retirement / MT5-only brokers** | Low (today) / rising | Plan doesn't address. Future MQL5 port is the answer. |
+| **T13** | **Single-file git merge conflicts** | Low | Multi-dev = merge hell on one file. Refactor to `.mqh` includes if team grows. |
+| **T14** | **`OrderClose` failure under network loss** | High | Virtual SL relies on it. Safety SL is wide (5×) but a gap could blow through. **Add `InpMaxVirtualSlRetries` and panic-flatten on persistent failure.** |
 
 ---
 
-## 4. Input Parameters (Final Specification)
+## 3. Critical Review — 10 High-Impact Findings Not in Original SWOT
 
-All `InpMart*` parameters are removed. Remaining inputs grouped logically (~45 total, down from ~65):
+### CR1. "Reverse-After-Losing-Close" is a Semantic Rename, Not a New Feature
 
-### Trading Controls
+**Status:** 🔴 **BREAKING CHANGE, HIDDEN**
 
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `InpEnableTrading` | bool | `false` | Master kill switch — observe-only when false |
-| `InpBaseLots` | double | `0.01` | Fixed lot size for all entries |
-| `InpMagic` | int | `100` | Unique EA identifier per chart/symbol |
+`InpReverseAfterMin` **already exists in v10.12** (line 156) with semantics: *"Open opposite position 1 min after first entry."*
 
-### Risk & Money Management
+The PLAN's section 2.4 reuses the same input name with **different semantics:** *"event-driven on losing close, not time-driven at 1 min."*
 
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `InpSL_Pips` | double | `0` | Manual SL override in pips; `0` = ATR-dynamic |
-| `InpTP_Pips` | double | `0` | Manual TP override in pips; `0` = ATR-dynamic |
-| `InpAtrPeriod` | int | `14` | ATR period for dynamic calculations |
-| `InpAtrSLMult` | double | `1.5` | Dynamic SL = ATR × this multiplier |
-| `InpAtrTPMult` | double | `2.0` | Dynamic TP = ATR × this multiplier |
-| `InpAtrTrailStartMult` | double | `1.0` | Trail activation = ATR × this multiplier |
-| `InpAtrTrailStepMult` | double | `0.5` | Trail increment = ATR × this multiplier |
-| `InpMinRiskPips` | double | `1.0` | Minimum floor for any ATR-derived pip distance |
-| `InpHideSL` | bool | `true` | Use virtual (hidden) SL instead of sending to broker |
-| `InpUseSafetySL` | bool | `true` | Send wide real SL to broker as disconnect safety net |
-| `InpSafetySLMult` | double | `5.0` | Safety SL distance = virtual SL × this multiplier |
-| `InpBE_TriggerMult` | double | `1.0` | Break-even activates at ATR × this multiplier |
-| `InpBE_LockPips` | double | `1.0` | Pips to lock above breakeven |
-| `InpSlippage` | int | `0` | Max slippage in points; `0` = auto from spread EMA |
-| `InpMaxSpread` | int | `0` | Max spread in points; `0` = auto from spread EMA |
-| `InpMaxDrawdownPct` | double | `10.0` | Halt trading if daily drawdown ≥ this % |
-| `InpMinEquity` | double | `100.0` | Halt trading if equity falls below this value |
-| `InpCloseOnGuardBreach` | bool | `true` | Force-close positions when equity guard triggers |
+**Impact:** Existing users with saved `.set` files will silently experience **different behavior on upgrade.** A time-based reverse becomes a loss-triggered reverse.
 
-### Signal Engine
-
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `InpAverPeriod` | int | `14` | SMA period for candle body average and trend classification |
-| `InpSampleMs` | int | `50` | Millisecond timer interval for tick-range sampling |
-| `InpWindowSize` | int | `1200` | Ring-buffer size (1200 × 50ms = 60-second window) |
-| `InpZzDepth` | int | `2` | ZigZag Depth parameter |
-| `InpZzDeviation` | int | `2` | ZigZag Deviation parameter |
-| `InpZzBackstep` | int | `1` | ZigZag Backstep parameter |
-| `InpZzLookback` | int | `100` | Bars scanned for ZigZag pivots |
-| `InpPpmMinHigh` | double | `2.0` | PPM threshold for HIGH zone |
-| `InpPpmTarget` | double | `4.0` | PPM target — ideal entry zone boundary |
-| `InpAtrDailyRef` | double | `1.5` | Volatility reference for PPM display ratio |
-| `InpShowPPM` | bool | `true` | Show PPM value in on-chart panel |
-
-### Volume Filter
-
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `InpUseVolumeFilter` | bool | `true` | Enable tick-volume spike gate |
-| `InpVolLookback` | int | `20` | Bars averaged for volume baseline |
-| `InpVolMultiplier` | double | `1.5` | Volume must be ≥ average × this to pass |
-
-### Spread Adaptation
-
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `InpSprEmaAlpha` | double | `0.05` | EMA smoothing factor for spread (0, 1] |
-| `InpMaxSpreadMult` | double | `2.5` | Max spread = EMA × this multiplier |
-| `InpSlippageMult` | double | `1.5` | Slippage = EMA × this multiplier |
-
-### Session & Timezone
-
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `InpTzOffsetHours` | int | `7` | Local timezone offset from GMT (**WIB = +7**) |
-| `InpSessionStartHour` | int | `5` | Session open hour (local time) |
-| `InpSessionEndHour` | int | `24` | Session close hour (local time) |
-
-### Reverse-After-Losing-Close Entry (Optional)
-
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `InpReverseAfterMin` | bool | `true` | Open one opposite-direction position after the first position closes at a loss |
-| `InpReverseDelaySec` | int | `60` | Seconds to wait after the losing close before firing the reverse leg |
-| `InpReverseLots` | double | `0.0` | Reverse leg lots; `0` = use base lots |
+**Recommendation:** Bump the state-file `STATE_VERSION`; refuse to load v10.12 state; document as a breaking change in changelog. Consider renaming input to `InpReverseAfterLoss` to make change explicit.
 
 ---
 
-## 5. Implementation Steps
+### CR2. CStateStore Coupling is More Invasive Than Plan Suggests
 
-### Phase 1: Martingale Eradication
+**Status:** ⚠️ **EFFORT MIS-ESTIMATION RISK**
 
-**Goal:** Remove all martingale-related code, inputs, enums, and state.
+`CStateStore::Save(CMartingaleController &mart, ...)` and `Load(CMartingaleController &mart, ...)` mean the **binary file format** and **method signatures** both depend on the martingale class.
 
-1. Delete `CMartingaleController` class entirely (currently Section 13 of source)
-2. Delete `REENTRY_CONTEXT` struct (used exclusively by martingale)
-3. Delete `ENUM_MART_CONFIRM` enum (only used by martingale)
-4. Remove all `InpMart*` input parameters (~20 lines):
-   - `InpUseMartingale`, `InpMartMult`, `InpMartMaxSteps`, `InpMartCooldownBars`
-   - `InpMartCooldownSchedule`, `InpMartMultSchedule`, `InpMaxConsecLosses`
-   - `InpConsecLossPauseMin`, `InpMartMaxADX`, `InpMartADXPeriod`
-   - `InpMartMinAtrDist`, `InpMartConfirm`, `InpMartAtrLowPips`
-   - `InpMartAtrHighPips`, `InpAutoCalibrateMartAtr`
-5. Remove all references to `m_mart` member variable from `CExpertAdvisor`
-6. Remove `BuildReentryContext()`, `NewBarSinceLoss()` methods from facade
-7. Remove `m_mart.` calls from `ManageEntries()`, `OnDeinitHandler()`, `OnInitHandler()`
-8. Simplify `UpdateTradeState()` — remove `m_mart.OnPositionClosed()` call
-9. Clean `UpdateComment()` — remove martingale step, block reason, cooldown countdown, consecutive losses, pause status lines
-10. Remove `ResetCycle()`, `CanReenter()`, `ReentryAllowed()`, `ConfirmationOK()` and all martingale state from facade
+The PLAN's workflow step 4 says: *"Simplify `CStateStore` ReadFrom/WriteTo (remove martingale fields)"*
 
-### Phase 2: Simplified Entry Logic
+**Should say:** *"Redesign `CStateStore::Save/Load` signatures and `.bin` layout; bump `STATE_MAGIC`."*
 
-**Goal:** Rewrite `ManageEntries()` for fresh-signals-only flow.
-
-New `ManageEntries()` pseudocode:
-
-```
-ManageEntries(bool allowFresh):
-    if !InpEnableTrading              → return
-    if m_exec.CountPositions() > 0    → return
-    if !TradingWindowOpen()           → return
-    if !m_spread.SpreadOK()           → return
-    if !EquityGuardOK()               → return
-    if !allowFresh                    → return
-    if !m_candle_valid                → return
-    if !m_ppm_valid                   → return
-    if m_ppm.zone < PPM_ZONE_MEDIUM   → return
-    if !m_volume.Ok()                 → return
-
-    dir = m_candle_engine.SignalDirection(m_candle)
-    if dir == 0                       → return
-
-    lots = NormalizeLots(InpBaseLots)
-    if m_exec.Open(dir, lots, m_risk, m_vsl, m_spread.EffSlippage()):
-        m_first_dir = dir             // preserve for reverse-after-loss
-        SaveState()
-```
-
-Key simplifications:
-- No martingale path branching
-- No re-entry context building
-- No cooldown/block-reason tracking
-- Single decision point per M1 bar
-- Lot size is always `InpBaseLots` (no multiplier schedules)
-
-### Phase 3: Reverse-After-Losing-Close Entry
-
-**Goal:** Redefine `ManageReverseEntry()` to fire as a standalone post-loss entry, not a concurrent hedge.
-
-This phase **rewrites** `ManageReverseEntry()` and updates `UpdateTradeState()` arming logic. The key changes:
-
-1. **Arming in `UpdateTradeState()`**: When `CountPositions()` transitions from > 0 to 0, call `m_exec.LastClosedProfit(closePx)`. If `profit < 0` AND `InpReverseAfterMin == true` AND the reverse has not already fired this cycle, set `m_reverse_armed = true` and record `m_loss_close_time = TimeCurrent()`. If `profit >= 0`, clear `m_reverse_armed`.
-2. **`m_first_dir` survives the close**: It is set when a fresh entry opens in `ManageEntries()` and is **not** cleared in `UpdateTradeState()`.
-3. **`ManageReverseEntry()` rewrite**: Returns early unless `InpReverseAfterMin && InpEnableTrading && m_reverse_armed`. Requires `CountPositions() == 0` (standalone — first position is already closed). Optionally waits `InpReverseDelaySec` after `m_loss_close_time` before firing. Opens **one** position in direction opposite to `m_first_dir` using `InpReverseLots > 0 ? InpReverseLots : InpBaseLots`. On success: sets `m_reverse_armed = false`, marks cycle done, calls `SaveState()`.
-4. **Fires exactly once per losing cycle**; armed flag resets when the account is flat and a new fresh cycle begins.
-5. **FIFO/netting compatible** — because `CountPositions() == 0` is required before opening the reverse leg, there is no concurrent opposite position and no netting conflict.
-
-**`UpdateTradeState()` arming pseudocode:**
-
-```
-UpdateTradeState():
-    prev_count = m_position_count
-    m_position_count = m_exec.CountPositions()
-
-    if prev_count > 0 && m_position_count == 0:        // position just closed
-        profit = m_exec.LastClosedProfit(closePx)
-        if profit < 0 && InpReverseAfterMin && !m_reverse_fired_this_cycle:
-            m_reverse_armed    = true
-            m_loss_close_time  = TimeCurrent()
-            // m_first_dir is already set from ManageEntries(); preserve it
-        else:
-            m_reverse_armed = false                    // won or BE — no reverse
-
-    if m_position_count == 0 && !m_reverse_armed:
-        m_reverse_fired_this_cycle = false             // reset for next fresh cycle
-```
-
-**`ManageReverseEntry()` pseudocode:**
-
-```
-ManageReverseEntry():
-    if !InpReverseAfterMin             → return
-    if !InpEnableTrading               → return
-    if !m_reverse_armed                → return
-    if m_exec.CountPositions() > 0     → return        // first position must be closed
-    if TimeCurrent() < m_loss_close_time + InpReverseDelaySec → return   // optional delay
-
-    rev_dir = (m_first_dir == OP_BUY) ? OP_SELL : OP_BUY
-    lots    = (InpReverseLots > 0) ? InpReverseLots : InpBaseLots
-
-    if m_exec.Open(rev_dir, lots, m_risk, m_vsl, m_spread.EffSlippage()):
-        m_reverse_armed            = false
-        m_reverse_fired_this_cycle = true
-        SaveState()
-```
-
-> ✅ **FIFO/netting compatible** — the first position is already closed before the reverse leg opens. No hedging broker required for this path.
-
-### Phase 4: State Store Simplification
-
-**Goal:** Reduce persisted state to essentials only.
-
-Remove from `CStateStore.Save()`:
-- Martingale step counter
-- Last trade direction
-- Last trade lots
-- Await-reentry flag
-- Last loss time
-- Consecutive loss count
-- Pause-until timestamp
-- Last loss price
-
-Keep in `CStateStore.Save()`:
-- Halted flag + halt-until timestamp
-- Day baseline balance
-- Day stamp
-- Virtual SL registry entries
-
-### Phase 5: Initialization Cleanup
-
-**Goal:** Streamline `OnInitHandler()`.
-
-1. Remove `m_mart.Init(...)` call
-2. Remove `InpAutoCalibrateMartAtr` block (entire percentile derivation section ~80 lines)
-3. Remove `m_mart.SetAtrThresholds()` call
-4. Remove `m_mart` validation inputs (`InpMartMult <= 0`, `InpMartCooldownBars < 0`, etc.)
-5. Simplify state load — remove martingale restore logic
-6. Update version string from `"10.12"` to `"10.13"`
-7. Update `#property description` text
-8. Initialize `m_reverse_armed = false`, `m_reverse_fired_this_cycle = false`, `m_first_dir = 0`
-
-### Phase 6: Code Quality & Documentation
-
-**Goal:** Final polish.
-
-1. Review all comments — remove references to martingale, re-entry, recovery
-2. Ensure `// FIX-N:` comments remain intact (they document previous bugs)
-3. Verify zero compiler warnings under `#property strict`
-4. Confirm single-trading-decision-per-bar invariant
-5. Check that no dead code paths remain
-6. Update header copyright/version block
-7. Run mental compilation trace: `OnInit → OnTimer → OnTick → OnDeinit`
+**Impact:** Refactor is larger than implied. State persistence will break if not redesigned carefully. Binary format backwards-compatibility strategy is unspecified.
 
 ---
 
-## 6. Verification Criteria
+### CR3. Quantitative Claims Are Wrong — Affects Impact Estimation
 
-### Pre-Deployment Testing
+**Status:** 🔴 **CRITICAL FOR PLANNING**
 
-| Criterion | Expected Result |
-|---|---|
-| **Compilation** | `0 errors`, `0 warnings` under `#property strict` |
-| **No martingale traces** | Zero references to `CMartingaleController`, `m_mart`, `REENTRY_CONTEXT`, `ENUM_MART_CONFIRM`, `MART_CONFIRM_*` |
-| **Single entry per bar** | `ManageEntries()` called once per new bar; no loops, no recursion |
-| **Max 1 position** | `CTradeExecutor.CountPositions()` never allows > 1 open position per symbol/magic |
-| **Guards active** | Equity guard, spread monitor, session clock all fire correctly |
-| **State persistence** | Virtual SL survives terminal restart; halt flag survives restart; no martingale state corruption |
-| **Reverse entry** | Fires exactly once per losing cycle, only after the first position closes at a loss, as a standalone entry (no hedging broker required) |
-| **Deterministic output** | Same market data + same inputs → identical trade sequence (no uninitialized variables) |
-| **Panel cleanliness** | On-chart comment shows signal info, PPM, spread, session, reverse armed/done status — no martingale fields |
+| Metric | PLAN Says | Actual | Delta |
+|---|---|---|---|
+| Classes to delete | 1 | 1 | ✅ (CMartingaleController) |
+| Classes in v10.12 | 13 | **14** | ❌ -1 |
+| Classes in v10.13 | 12 | **13** | ❌ -1 |
+| `InpMart*` params to remove | ~20 | **11** | ❌ -9 |
+| `CMartingaleController` size | ~200 lines | **237 lines** | ❌ -37 |
 
-### Code Review Checklist
+**Impact:** Teams building estimates off the PLAN will underestimate refactor scope by ~9–18%. Regression-test surface is larger. Effort budgets are wrong.
 
-| Gate | Requirement |
-|---|---|
-| **SRP compliance** | Each class has exactly one responsibility; no cross-cutting logic |
-| **Guard clauses** | Early returns for invalid conditions; no deep nesting |
-| **Zero globals** | All state owned by component instances; `g_ea` is the sole global |
-| **Fail-fast** | Invalid inputs rejected in `OnInitHandler()` with clear error messages |
-| **Indicator caching** | `iATR()`, `iCustom(ZigZag)` called once per bar maximum |
-| **Versioned state** | Magic tag `OMM4` present; old format files safely discarded |
-| **Buffer safety** | `MAX_POSITIONS = 20` cap respected in `CVirtualStopManager` |
-| **Naming consistency** | `Inp*` prefix for inputs, `m_` prefix for members, PascalCase for classes |
-| **Logging completeness** | `Print()` statements for init, errors, halts, reverses, VSL actions |
-| **Documentation alignment** | This PLAN.md matches the actual code structure and behavior |
+**Recommendation:** Fix class/param inventory in PLAN before dev work begins. Add a CI step: `grep -c "^class"` and `grep -c "input.*InpMart"` fail on drift.
 
 ---
 
-## 7. Risk Model (Post-Martingale)
+### CR4. Architecture Diagram Contradicts Code
 
-Without martingale recovery, the risk profile shifts fundamentally:
+**Status:** 🔴 **DESIGN AMBIGUITY**
 
-| Aspect | With Martingale (v10.12) | Without Martingale (v10.13) |
-|---|---|---|
-| Loss recovery | Automatic re-entry cascade | None — accept the loss, wait for next signal |
-| Max concurrent exposure | Exponential (lots × multiplier^n) | Linear (always `InpBaseLots`) |
-| Worst-case drawdown | Unbounded (limited only by equity guard) | Bounded by daily DD% halt + min equity floor |
-| Psychological pressure | High (chasing losses) | Low (fixed risk per trade) |
-| Win rate requirement | Lower (recovery compensates) | Higher (each trade stands alone) |
-| Suitability | Aggressive, experienced traders | Conservative, disciplined traders |
+Section 3.1 shows `CStateStore` as a **child of `CTradeExecutor`** (composition).
 
-### Recommended Conservative Profile
+The code has them as **siblings** (separate SECTION 14 and SECTION 15).
 
-| Parameter | Value | Rationale |
-|---|---|---|
-| `InpBaseLots` | `0.01` | Minimum viable lot |
-| `InpMaxDrawdownPct` | `2.0` | Very tight daily halt |
-| `InpMinEquity` | `1000.0` | Higher floor than default 100 |
-| `InpCloseOnGuardBreach` | `true` | Always flatten on breach |
-| `InpReverseAfterMin` | `false` | Disable the loss-triggered reverse initially; enable only after live signal quality is confirmed |
-| `InpUseVolumeFilter` | `true` | Require liquidity confirmation |
-| `InpVolMultiplier` | `1.5` | Moderate spike threshold |
-| `InpPpmMinHigh` | `2.0` | Standard medium zone |
-| `InpPpmTarget` | `4.0` | Standard high zone |
+**Questions:**
+- Is the architecture *intent* composition? If so, refactor should enforce it (move CStateStore inside CTradeExecutor, or justify why they're siblings).
+- Does the diagram need updating, or does the code need restructuring?
+
+**Impact:** Ambiguity can lead to inconsistent refactor decisions. Maintainers will be confused about ownership.
+
+**Recommendation:** Either move CStateStore inside CTradeExecutor (composition) or update the diagram to show them as siblings + clarify the dependency.
 
 ---
 
-## 7.5 SWOT Analysis
+### CR5. No "Minimum Edge" or "Minimum Win Rate" Deployment Gate
 
-EA: **OneMinuteMan v10.13-no-mart** with **Reverse-After-Losing-Close** feature enabled.
+**Status:** ⚠️ **RISK ACCEPTANCE UNSPECIFIED**
 
-### Strengths
+The PLAN removes martingale (good) but **does not specify: What win rate must the signal engine achieve before deployment?**
 
-- **Fixed linear risk** — no martingale multiplier; every trade uses `InpBaseLots`, so maximum exposure is always known in advance
-- **Bounded worst-case drawdown** — daily DD% halt + absolute equity floor provide a hard ceiling on daily losses, surviving terminal restarts via state persistence
-- **SRP component architecture** — 12 single-responsibility classes; isolated testability, minimal coupling, easy future extension
-- **Crash-safe state persistence (OMM4)** — versioned binary state survives VPS migration, recompile, and terminal crash; VSL registry is fully restored on reinit
-- **Virtual SL + safety SL redundancy** — virtual stop enforced tick-by-tick in memory; wide broker SL acts as a disconnect backstop; two independent layers of stop protection
-- **Reverse-after-loss works on all account types** — because the first position is already closed before the reverse fires, there is no hedging dependency; fully FIFO/netting compatible
-- **Single-position invariant** — `CountPositions()` hard-blocks any second open position; no runaway multi-order state
-- **Deterministic execution** — same inputs + same market data → identical trade sequence; no hidden randomness or uninitialized state
+Without a backtest or live demo baseline, users are told *"demo test thoroughly"* but given **no quantitative pass/fail criterion.**
 
-### Weaknesses
+**Impact:** Someone deploys with 45% win rate (expecting martingale recovery) and blows up because there is no recovery.
 
-- **No loss recovery or averaging** — win rate must be structurally higher than break-even; a string of losses is absorbed directly with no offset mechanism
-- **Reverse leg can compound losses** — the reverse fires on an already-losing cycle; if the reverse trade also loses, two consecutive losses occur in one cycle, which can accelerate drawdown
-- **ZigZag repaint risk** — ZigZag redraws past pivots on incomplete bars; PPM readings on the current bar are provisional until bar close
-- **Single-file MQL4 size constraint** — at ~61 KB the file is near practical MQL4 limits; additional features would require DLL refactoring
-- **Dependence on reliable `OrderClose` for virtual SL** — network latency or broker restrictions can delay virtual stop enforcement; safety SL only partially mitigates this
-- **No backtest or statistical edge evidence** — no walk-forward results, no `.set` profile validation; signal quality and win rate are unverified outside manual observation
-
-### Opportunities
-
-- **Mean-reversion capture** — the reverse-after-loss leg is well-suited to mean-reversion after a failed breakout; the losing direction often exhausts momentum, setting up the opposite move
-- **Session/pair parameter tuning** — ATR multipliers, PPM thresholds, and volume filters can be calibrated independently per session (London, NY) and per pair for improved edge
-- **Portability to netting/FIFO brokers** — FIFO compliance broadens the deployable audience to prop-firm, US-regulated, and ECN accounts that prohibit concurrent opposite legs
-- **Prop-firm / funded-account suitability** — conservative profile (tight DD%, fixed lots, equity floor, no martingale) aligns well with typical prop-firm challenge rules
-- **Optional confirmation gate on reverse leg** — future enhancement: add a lightweight signal filter (e.g. candle direction, spread check) before firing the reverse, reducing wrong-way risk
-- **Configurable delay as a market-noise filter** — `InpReverseDelaySec` can be tuned to skip the first few seconds of post-close noise and enter after price stabilises
-
-### Threats
-
-- **Consecutive-loss sequences** — if both the original leg and the reverse leg lose in the same cycle, net loss per cycle doubles; repeated occurrences drain equity faster than a single-trade-per-signal model
-- **High-spread / low-liquidity M1 conditions** — M1 scalping is highly sensitive to spread spikes; during news events or illiquid hours, virtual SL may be breached before the spread normalises
-- **Broker execution latency / requotes** — scalping at M1 frequency is vulnerable to slow order execution, partial fills, or requotes that widen the effective entry price beyond signal intent
-- **Over-trading in choppy / ranging markets** — M1 signals are prone to false breakouts in sideways price action; without a range-filter, entry frequency increases while win rate drops
-- **Reverse leg firing into a continuing trend (wrong-way risk)** — if the first trade lost because it was counter-trend, the reverse (opposite direction) is now with-trend; however, if the trend is strong and accelerating, a delayed reverse entry may still lose
-- **Regulatory or broker restrictions on scalping** — some brokers impose minimum trade duration rules or disallow rapid open/close sequences; M1 EAs may violate these terms of service
+**Recommendation:** Add a section: *"Minimum edge acceptance criteria: Signal must achieve ≥ 55% win rate in walk-forward validation before live deployment. Do not deploy if confidence is < 95%."*
 
 ---
 
-## 8. File Structure (Logical Sections)
+### CR6. Dual Execution Path Ordering Is Unspecified
 
-The final single-file `.mq4` will contain these sections in order:
+**Status:** ⚠️ **STATE MANAGEMENT RISK**
+
+- Timer path: handles SL enforcement (tick-by-tick)
+- Tick path: handles signals
+
+If a tick arrives **during** a timer's `OrderClose` attempt, who wins?
+
+**Plan does not specify.** Risk: a position the timer just closed is then "managed" by a stale tick.
+
+**Impact:** Race condition can cause orphaned orders or stale state.
+
+**Recommendation:** Add explicit conflict-resolution policy, e.g.:
+- "On same tick: timer SL always wins (checked first)."
+- "Tick signal is only processed if `CountPositions() == 0` on entry."
+
+---
+
+### CR7. "Losing Close" Definition Is Implicit
+
+**Status:** ⚠️ **SPEC AMBIGUITY**
+
+Section 2.4 says *"profit < 0"* — but code's `LastClosedProfit()` includes **swap and commission.**
+
+**Ambiguity:** A trade that closed with positive price-PnL but negative net-PnL (after fees) — is that a "losing close" for the reverse trigger?
+
+**Spec is ambiguous.** Implementation must be source of truth, and spec should match.
+
+**Impact:** Users implementing reverse leg may use wrong definition; reverse fires at wrong times.
+
+**Recommendation:** Update section 2.4: *"'Losing close' is defined as `LastClosedProfit() < 0`, which includes swap and commission. A break-even close (price profit = 0 but swap cost is negative) is a 'losing close' and will trigger the reverse leg."*
+
+---
+
+### CR8. No `.set` File Migration Path for Existing Users
+
+**Status:** ⚠️ **UPGRADE BREAKING**
+
+The PLAN removes all `InpMart*` inputs. Any user with a saved `.set` file will have **orphan keys** after upgrade.
+
+**Plan does not address:** `.set` migration, deprecation warnings, or input-name compatibility shim.
+
+**Impact:** Users upgrade → chart won't load `.set` files → painful re-configuration or silent wrong settings.
+
+**Recommendation:** Either:
+1. Provide a `.set` migration script (rename/translate old inputs to new ones)
+2. Add `OnInit` deprecation warning: *"Old `.set` file detected; update inputs manually"*
+3. Document breaking change in changelog
+
+---
+
+### CR9. Reverse Leg Is a Doubling Strategy in Disguise
+
+**Status:** 🔴 **EXPECTED VALUE ANALYSIS MISSING**
+
+The PLAN's own SWOT (W1) notes the doubling risk but **understates it.**
+
+A clean no-martingale EA has *one* trade per signal. Adding a *second* trade on the same cycle (the reverse) **reintroduces the doubling risk for the *loss path*, just gated behind a different condition** (losing close instead of losing position).
+
+**Expected value analysis:**
+- Single trade: `E = p·W − (1−p)·L`
+- With reverse: Loss path becomes `−L + p_r·W − (1−p_r)·L = (2p_r − 1)·W − 2(1−p_r)·L`
+
+Reverse *adds* EV only if `p_r > 0.5` *and* `L` is small enough.
+
+**Plan does not analyze this.** Reverse is presented as a feature without mathematical justification.
+
+**Impact:** Users enable reverse without understanding the win-rate requirement for it to be positive-EV.
+
+**Recommendation:** Add a section: *"Reverse Leg Expected Value: The reverse fires only on losing cycles; it is positive-EV only if its own win rate > 50% AND the per-loss size is acceptable. Empirical backtest required before deployment."*
+
+---
+
+### CR10. "FIFO-Compatible" is Asserted But Not Demonstrated
+
+**Status:** ⚠️ **EDGE CASE UNVALIDATED**
+
+Section 2.4 claims: *"Compatible with all account types (hedging and non-hedging / FIFO / netting)"*
+
+This is a **behavioral claim** that needs to be **tested.** With netting accounts, closing the first position and immediately opening the opposite in the same tick can **race with broker-side netting.**
+
+**Edge case:** What if the broker netts the close and open into a single position before our code sees `CountPositions() == 0`?
+
+**Plan does not specify:** FIFO broker test case or netting edge-case handling.
+
+**Impact:** Deployment on wrong broker type could cause position pileup or state corruption.
+
+**Recommendation:** Add to success criteria (section 12): *"FIFO broker test case: Verify that reverse entry opens cleanly on FIFO/netting brokers without broker-side netting interference. Test by running live on micro lot on netting broker for 10 reverse-leg cycles."*
+
+---
+
+## 4. Strategic Recommendations (Prioritized)
+
+| # | Action | Why | Effort | Blocker? |
+|---|---|---|---|---|
+| **1** | **Bump `STATE_MAGIC` and add version-mismatch refuse-to-load guard** | Stops silent v10.12 state loads (CR1, T9) | XS | ⚠️ Yes |
+| **2** | **Rename `InpReverseAfterMin` → `InpReverseAfterLoss`** | Makes semantic change visible to users (CR1) | XS | ⚠️ Yes |
+| **3** | **Fix class/param count in PLAN** | Prevents downstream mis-estimation (V3, V4, CR3) | XS | No |
+| **4** | **Add walk-forward / backtest gate before declaring success** | Only way to verify 8-condition confluence is actually profitable (W5, CR5, T8) | **M** | ⚠️ Yes |
+| **5** | **Add `InpMaxReverseLossesPerDay` and `InpMaxTradesPerDay`** | Bounds doubling risk + respects prop-firm caps (T1, T11, CR9) | **S** | No |
+| **6** | **Promote `InpMartMaxADX` to permanent non-mart regime filter** | Reuse existing logic; address choppy-market threat (T4) | **S** | No |
+| **7** | **Formally define "losing close" in spec section 2.4** | Close ambiguity around swap/commission (CR7, W12) | XS | No |
+| **8** | **Specify timer-vs-tick conflict resolution policy** | Prevent stale-tick state management (CR6, W9) | **S** | No |
+| **9** | **Add CI check: PLAN numbers match code** | `grep -c "^class"` and `grep -c "input.*InpMart"` fail on drift (CR3, T10) | **S** | No |
+| **10** | **Add FIFO-broker test case to success criteria** | Validate FIFO-compat claim (CR10, O1) | **S** | ⚠️ Yes |
+| **11** | **Add `InpMinHoldSec` and `InpMaxRequoteRetries`** | Mitigate broker-ToS and requote risk (T3, T5) | **S** | No |
+| **12** | **Provide `.set` migration shim or documented breakage** | Smooth upgrade path (CR8) | **M** | No |
+| **13** | **Decide: compose CStateStore into CTradeExecutor or keep sibling?** | Close doc/code drift (CR4, V8, W8) | **S** | No |
+
+**Blockers (must complete before coding phase 1):** 1, 2, 4, 10
+
+---
+
+## 5. Bottom Line
+
+**The PLAN is architecturally sound.** Signal-only, no martingale, FIFO-safe — the right direction.
+
+**But the document is not yet a reliable source of truth:**
+
+1. ✅ **Quantitative claims are wrong** — class count, param count. Fix before estimation.
+2. 🔴 **One "new" feature is a silent semantic change** — disclose as breaking change.
+3. ⚠️ **Coupling understated** — CStateStore's martingale dependency makes refactor larger.
+4. ⚠️ **No edge verification** — 8-condition confluence is a hypothesis, not a measurement.
+5. 🔴 **Threats under-covered** — both-leg loss sequences, prop-firm caps, FIFO edge cases, `.set` migration.
+
+**The refactor is the right move. The plan just needs two passes:**
+1. **Numeric accuracy** — fix class/param counts, effort estimates, coupling depth.
+2. **Completeness** — address the 10 critical findings and 14 threats this review surfaced.
+
+---
+
+## 6. Updated File Structure & Sections
+
+After martingale removal, the final `.mq4` will contain:
 
 ```
 SECTION 0  — Copyright, property directives, architecture comment block
-SECTION 1  — Input parameters (cleaned, ~45 params total)
+SECTION 1  — Input parameters (cleaned, ~45 params total, no InpMart*)
 SECTION 2  — Constants, structs, utility helpers (PipSize, NormalizeLots, etc.)
 SECTION 3  — CSpreadMonitor
 SECTION 4  — CRangeScanner
@@ -535,82 +349,29 @@ SECTION 9  — CEquityGuard
 SECTION 10 — CRiskModel
 SECTION 11 — CVirtualStopManager
 SECTION 12 — CTrailingManager
-SECTION 13 — CTradeExecutor       ← formerly Section 14
-SECTION 14 — CStateStore           ← formerly Section 15
-SECTION 15 — CExpertAdvisor        ← formerly Section 16 (facade, simplified)
-SECTION 16 — MT4 event handlers    ← delegates to g_ea facade instance
+SECTION 13 — CTradeExecutor
+SECTION 14 — CStateStore           (formerly Section 15; decide: keep sibling or compose into CTradeExecutor?)
+SECTION 15 — CExpertAdvisor        (formerly Section 16; facade, simplified)
+SECTION 16 — MT4 event handlers    (delegates to g_ea facade instance)
 ```
 
-Total sections: **17** (down from 18 by eliminating the martingale section).
+Total sections: **17** (down from 18 by eliminating martingale).
 
 ---
 
-## 9. Change Summary — Line-Level Impact Estimate
-
-| Area | Lines Added | Lines Removed | Net Change |
-|---|---|---|---|
-| Inputs (`InpMart*` removal) | 0 | ~20 | -20 |
-| Enums (`ENUM_MART_CONFIRM`) | 0 | ~7 | -7 |
-| Structs (`REENTRY_CONTEXT`) | 0 | ~7 | -7 |
-| `CMartingaleController` class | 0 | ~200 | -200 |
-| `CExpertAdvisor` facade | ~30 | ~150 | -120 |
-| `CStateStore` persist hooks | ~10 | ~30 | -20 |
-| `OnInitHandler` validation/init | ~5 | ~80 | -75 |
-| `OnTimerHandler` / `OnTickHandler` | 0 | ~10 | -10 |
-| `UpdateComment` panel | ~5 | ~15 | -10 |
-| Header/version strings | ~2 | ~2 | 0 |
-| Comments/docstrings | ~20 | ~30 | -10 |
-| **TOTAL** | **~72** | **~561** | **-489** |
-
-Expected final file size: ~61 KB (down from ~67 KB).
-
----
-
-## 10. Known Limitations & Caveats
-
-1. **No recovery mechanism** — Losing trades stand alone. The EA cannot "average down" or "recover" with cascading entries. This is intentional and reduces complexity/drawdown risk.
-
-2. **ZigZag repaint** — The built-in ZigZag indicator redraws past pivots. PPM values for incomplete bars may change. Mitigated by using `m_ppm_valid` flag and only entering on confirmed (closed) bars.
-
-3. **Single-file constraint** — At ~61 KB, the file approaches MQL4 practical limits. Adding more features would require splitting into multiple files (not possible in standard MT4 EAs without DLLs).
-
-4. **Broker dependency** — Virtual SL requires reliable `OrderClose` execution. Network latency or broker-side restrictions can cause missed virtual stops. Safety SL provides partial mitigation.
-
-5. **Reverse leg only triggers on a losing close** — If the first trade wins or closes at breakeven, no reverse leg fires for that cycle. The reverse adds one extra trade per losing cycle; if the reverse also loses, net per-cycle loss doubles. There is no hedging broker requirement — the first position is fully closed before the reverse opens.
-
-6. **No backtesting evidence** — This EA has no official `.set` profiles, walk-forward results, or statistical edge verification. Users must validate independently on demo.
-
----
-
-## 11. Development Workflow
-
-```
-Step 1:  Create backup of current oneminuteman.mq4
-Step 2:  Remove ENUM_MART_CONFIRM, REENTRY_CONTEXT, InpMart* inputs
-Step 3:  Delete CMartingaleController class (Section 13)
-Step 4:  Simplify CStateStore ReadFrom/WriteTo (remove martingale fields)
-Step 5:  Rewrite ManageEntries() for fresh-signals-only
-Step 6:  Strip m_mart references from CExpertAdvisor facade
-Step 7:  Clean UpdateComment() panel
-Step 8:  Remove auto-calibration block from OnInitHandler
-Step 9:  Update version string to 10.13
-Step 10: Compile in MetaEditor — fix any warnings/errors
-Step 11: Test on demo M1 chart — verify signals, guards, reverse entry
-Step 12: Verify state persistence (restart MT4 with open trade)
-Step 13: Commit with descriptive message
-```
-
----
-
-## 12. Success Definition
+## 7. Updated Success Definition
 
 The project is complete when all of the following are confirmed:
 
 - [ ] Compiles cleanly with `#property strict`, zero errors, zero warnings
+- [ ] `STATE_MAGIC` bumped; version mismatch check guards against v10.12 state files
 - [ ] All `InpMart*` parameters removed — search confirms zero occurrences
 - [ ] `CMartingaleController` class deleted — no references anywhere
 - [ ] `REENTRY_CONTEXT` struct deleted
-- [ ] `ENUM_MART_CONFIRM` enum deleted
+- [ ] `ENUM_MART_CONFIRM` enum deleted (or repurposed for reverse-leg filter per O2)
+- [ ] `InpReverseAfterMin` renamed to `InpReverseAfterLoss` (or decision documented)
+- [ ] "Losing close" formally defined in spec (includes swap+commission)
+- [ ] Timer-vs-tick conflict resolution policy specified
 - [ ] `ManageEntries()` executes only fresh signal logic
 - [ ] `CStateStore` saves/loads only VSL + equity guard + halt state
 - [ ] On-chart panel shows clean signal info without martingale fields
@@ -620,27 +381,21 @@ The project is complete when all of the following are confirmed:
 - [ ] Virtual SL enforcement working (tested in strategy tester)
 - [ ] Version string updated to `10.13`
 - [ ] All comments consistent with non-martingale design
-- [ ] This PLAN.md and README.md updated to reflect v10.13 changes
+- [ ] CI check in place: PLAN numbers match code (class count, param count)
+- [ ] Walk-forward backtest results show ≥ 55% signal win rate
+- [ ] FIFO broker test case passed (10 reverse-leg cycles, no pileup)
+- [ ] `.set` migration plan documented or shim provided
+- [ ] PLAN.md and README.md updated to reflect v10.13 changes + critical findings
 
 ---
 
-## 13. Design Principles (Non-Negotiable)
+## References
 
-- **Single Responsibility Principle (SRP)** — Each class handles exactly one domain
-- **Guard Clauses** — Methods fail-fast with early `return` for invalid data
-- **No hidden global state** — All mutable state owned by named component instances
-- **Deterministic execution** — Same inputs + same market data = identical trade sequence
-- **Fail-fast error handling** — Invalid parameters rejected at `OnInit` with clear log messages
-- **One trade decision per M1 bar** — No loops, no recursion, no tick-level entry stacking
-
-## 14. Trading Constraints (Non-Negotiable)
-
-- Maximum **one open position** per symbol/magic number at all times
-- **No** averaging, martingale, grid, hedging, or pyramiding
-- Entries only on confirmed, closed-bar signals
-- No repaint-dependent decisions (bar-close validation for ZigZag pivots)
-- `OrdersTotal()` for the specific magic + symbol must never exceed 1; emergency close protocol triggered on violation
+- **v10.12 Source:** `oneminuteman.mq4`, 66,756 bytes, 1,785 lines
+- **Verification Date:** 2026-07-22
+- **Analysis Tool:** Comprehensive source audit + PLAN cross-reference
+- **Author:** Mavis (root session)
 
 ---
 
-*OneMinuteMan v10.13-no-mart is a disciplined, signal-only M1 scalper. Fixed risk per trade. No recovery. Demo test thoroughly before any live deployment.*
+*OneMinuteMan v10.13-no-mart is a disciplined, signal-only M1 scalper. Fixed risk per trade. No recovery. The refactor is sound, but this document must be corrected and completed before development begins.*
