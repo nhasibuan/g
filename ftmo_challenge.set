@@ -1,0 +1,64 @@
+; OneMinuteMan v10.14 -- FTMO Challenge Profile
+; Target: prop-firm rules (FTMO, MFF, The5ers typical)
+; Max daily loss: 5%, max total loss: 10%, profit target: 10%
+; Risk: conservative 0.01 base lots, ADX filter ON, win-rate halt ON
+; IMPORTANT: Set InpEnableTrading=1 only after reading all risk warnings
+; Last updated: 2026-07-27
+
+InpSampleMs=50
+InpWindowSize=1200
+InpAverPeriod=14
+InpZzDepth=2
+InpZzDeviation=2
+InpZzBackstep=1
+InpZzLookback=100
+InpPpmMinHigh=2.0
+InpPpmTarget=4.0
+InpAtrDailyRef=1.5
+InpShowPPM=1
+InpUseVolumeFilter=1
+InpVolLookback=20
+InpVolMultiplier=1.5
+InpEnableTrading=0
+InpBaseLots=0.01
+InpSlippage=0
+InpMaxSpread=0
+InpMagic=200
+InpTP_Pips=0
+InpSL_Pips=0
+InpHideSL=1
+InpTrailStart=0
+InpTrailStep=0
+InpBE_TriggerMult=1.0
+InpBE_LockPips=1.0
+InpUseSafetySL=1
+InpSafetySLMult=5.0
+InpAtrPeriod=14
+InpAtrSLMult=1.5
+InpAtrTPMult=2.0
+InpAtrTrailStartMult=1.0
+InpAtrTrailStepMult=0.5
+InpMinRiskPips=1.0
+InpMaxSpreadMult=2.0
+InpSlippageMult=1.5
+InpSprEmaAlpha=0.05
+InpEnableLossReversal=1
+InpLossReversalDelaySec=10
+InpReverseLots=0.0
+InpReverseConfirm=2
+InpMaxReverseLossesPerDay=2
+InpMaxTradesPerDay=3
+InpMinHoldSec=30
+InpMaxDrawdownPct=4.0
+InpMinEquity=100.0
+InpCloseOnGuardBreach=1
+InpTzOffsetHours=7
+InpSessionStartHour=7
+InpSessionEndHour=20
+InpUseAdxFilter=1
+InpAdxPeriod=14
+InpAdxThreshold=22.0
+InpUseWinRateHalt=1
+InpWinRateWindow=20
+InpMinWinRate=0.45
+InpReversalArmTimeoutSec=180

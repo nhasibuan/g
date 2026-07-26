@@ -4,9 +4,9 @@
 
 ## Overview
 
-**OneMinuteMan (OMM)** is a single-file, component-based MQL4 Expert Advisor at **version 10.13**, designed for M1 (1-minute) timeframe scalping. Built by [Norman Hasibuan](https://github.com/nhasibuan) with AI-assisted development, it combines candlestick pattern recognition, a ZigZag-based Pips-Per-Minute (PPM) momentum engine, ATR-dynamic risk management, virtual stop-losses, and an event-driven loss-reversal system.
+**OneMinuteMan (OMM)** is a single-file, component-based MQL4 Expert Advisor at **version 10.14**, designed for M1 (1-minute) timeframe scalping. Built by [Norman Hasibuan](https://github.com/nhasibuan) with AI-assisted development, it combines candlestick pattern recognition, a ZigZag-based Pips-Per-Minute (PPM) momentum engine, an **ADX regime filter**, ATR-dynamic risk management, virtual stop-losses, an event-driven loss-reversal system, and a **rolling win-rate performance tracker**.
 
-**v10.13 removes all martingale logic.** The EA is now a pure signal-only scalper with fixed linear risk per trade and an optional loss-reversal engine that opens a reverse-direction position after a losing close. FIFO/netting compatible.
+**v10.14 adds ADX regime filter + CPerformanceTracker.** Building on v10.13's martingale removal, v10.14 implements the two highest-ROI opportunities identified by an independent code audit: an ADX trend-strength gate (closes W9/T4 — no entries in choppy markets) and a CPerformanceTracker class with rolling win-rate, auto-halt, and CSV trade log.
 
 The EA forcibly operates on M1 candle data regardless of the chart timeframe, enabling focused 1-minute scalping strategy with comprehensive protection.
 
@@ -14,9 +14,9 @@ The EA forcibly operates on M1 candle data regardless of the chart timeframe, en
 
 ## What This Is
 
-**OneMinuteMan** is a MetaTrader 4 Expert Advisor (EA) written in MQL4, designed for M1 (1‑minute) scalping with **fixed linear risk** and comprehensive risk mitigations. It's a single `.mq4` file, internally organized into **13 single‑responsibility classes** behind a `CExpertAdvisor` facade.
+**OneMinuteMan** is a MetaTrader 4 Expert Advisor (EA) written in MQL4, designed for M1 (1‑minute) scalping with **fixed linear risk** and comprehensive risk mitigations. It's a single `.mq4` file, internally organized into **15 single‑responsibility classes** behind a `CExpertAdvisor` facade.
 
-**v10.13 (no-mart):** Martingale recovery has been completely removed. The EA now operates as a pure signal-only entry system with an optional event-driven loss-reversal engine.
+**v10.14:** ADX regime filter (`CAdxFilter`) and performance tracker (`CPerformanceTracker`) added. All martingale logic was removed in v10.13 and this release builds on that clean foundation.
 
 ---
 
@@ -35,11 +35,11 @@ The EA is structured as a **single-file component architecture** using classic O
 | Pattern | Implementation |
 |---|---|
 | **Facade** | `CExpertAdvisor` — single entry point delegating all MT4 events |
-| **Single Responsibility** | 13 decoupled component classes, each with one clearly-defined purpose |
-| **Memento** | `CStateStore` — versioned binary state persistence for crash-safe recovery (OMM5 format) |
+| **Single Responsibility** | 15 decoupled component classes, each with one clearly-defined purpose |
+| **Memento** | `CStateStore` — versioned binary state persistence for crash-safe recovery (OMM6 format) |
 | **Guard Clauses** | No hidden global mutation; all state owned by components |
 
-### The 13 Core Components
+### The 15 Core Components
 
 #### Signal & Market Analysis
 - **`CSpreadMonitor`** — Calculates rolling EMA of bid-ask spread; adaptive max-spread & slippage multipliers (symbol-agnostic)
@@ -47,17 +47,19 @@ The EA is structured as a **single-file component architecture** using classic O
 - **`CCandleEngine`** — Classifies 11 candlestick types (Hammer, Marubozu, 3 Doji variants, Long/Short, Spinning Top, Inverted Hammer) and derives trend direction vs SMA
 - **`CPpmEngine`** — Uses ZigZag indicator to compute pips-per-minute efficiency; classifies zones as LOW / MEDIUM / HIGH
 - **`CVolumeFilter`** — Tick-volume spike gate; blocks entries when volume is below threshold to ensure liquidity confirmation
+- **`CAdxFilter`** _(v10.14)_ — ADX trend-strength regime filter; blocks fresh entries when `ADX < InpAdxThreshold` (default 20) to avoid choppy markets
 
-#### Session & Risk Management
+#### Session, Risk & Performance
 - **`CSessionClock`** — Timezone-aware session window; daily halt flag persists across restarts
 - **`CEquityGuard`** — Dual protection: max daily drawdown % and absolute equity floor; evaluated every tick; can auto-flatten on breach
 - **`CRiskModel`** — ATR-dynamic SL/TP/trailing/break-even with manual pip overrides and minimum risk floor
+- **`CPerformanceTracker`** _(v10.14)_ — Rolling win-rate over last N trades; optional auto-halt below threshold; writes per-trade CSV log
 
 #### Protection & Execution
 - **`CVirtualStopManager`** — Hidden SL registry with retry logic; sends wide broker "safety SL" for disconnect protection
 - **`CTrailingManager`** — Break-even promotion and ATR-based trailing stop management
 - **`CTradeExecutor`** — `OrderSend` with dynamic params; emergency flatten; closed-profit scanning; ensures max 1 open position per symbol
-- **`CStateStore`** — Versioned binary save/load using Memento pattern (OMM5 format); survives terminal crash without losing state
+- **`CStateStore`** — Versioned binary save/load using Memento pattern (OMM6 format); survives terminal crash without losing state
 
 ---
 
@@ -65,7 +67,7 @@ The EA is structured as a **single-file component architecture** using classic O
 
 ### Signal Logic (Entry Conditions)
 
-**All conditions must be true for a fresh entry (11-AND conjunctive gate):**
+**All conditions must be true for a fresh entry (12-AND conjunctive gate):**
 
 1. Trading enabled (`InpEnableTrading = true`)
 2. No open position on the symbol (single-position invariant)
@@ -78,6 +80,7 @@ The EA is structured as a **single-file component architecture** using classic O
 9. PPM zone is MEDIUM or HIGH (ZigZag momentum confirmed)
 10. Tick volume ≥ multiplier × average (liquidity spike confirmed)
 11. Candle produces a directional signal (pattern + trend aligned)
+12. ADX ≥ threshold (trend-strength regime gate — new in v10.14)
 
 ### Loss-Reversal Engine (v10.13)
 
@@ -310,21 +313,43 @@ The EA can optionally open a reverse-direction position **after a losing close**
 | `InpTzOffsetHours` | `7` | Local timezone offset from GMT (e.g., WIB = +7) |
 | `InpSessionStartHour` | `5` | Session open hour (local time) |
 | `InpSessionEndHour` | `24` | Session close hour (local time) |
+| **v10.14 — ADX Regime Filter** | | |
+| `InpUseAdxFilter` | `true` | Enable ADX trend-strength gate; blocks entry in choppy markets |
+| `InpAdxPeriod` | `14` | ADX indicator period |
+| `InpAdxThreshold` | `20.0` | Minimum ADX value for a fresh entry to be allowed |
+| **v10.14 — Performance Tracker & Win-Rate Halt** | | |
+| `InpUseWinRateHalt` | `false` | Halt trading if rolling win-rate falls below `InpMinWinRate` |
+| `InpWinRateWindow` | `20` | Number of trades in the rolling win-rate window |
+| `InpMinWinRate` | `0.45` | Minimum acceptable win-rate; auto-halt if below (requires full window) |
+| **v10.14 — Reversal Safety** | | |
+| `InpReversalArmTimeoutSec` | `300` | Auto-disarm reversal if not fired within N seconds; `0` = off |
 
 ---
 
+## Preset Profiles (`.set` Files)
+
+Two preset files are shipped with the EA. Load them via MT4 Strategy Tester → Settings → Load or the EA property dialog → Load.
+
+| File | Use Case | Key Settings |
+|---|---|---|
+| `conservative.set` | Personal accounts, initial demo testing | Lots=0.01, DD=5%, Trades=5/day, ADX=ON |
+| `ftmo_challenge.set` | FTMO/MFF/The5ers challenge accounts | Lots=0.01, DD=4%, Trades=3/day, ADX=ON, WinRateHalt=ON |
+
+> [!IMPORTANT]
+> Both presets ship with `InpEnableTrading=false`. Enable trading only after demo-validating on your broker and reviewing all risk warnings.
+
 ## Overall Assessment
 
-**OneMinuteMan v10.13** is a technically sophisticated, well-documented MT4 scalping EA with fixed linear risk, comprehensive persistent risk controls, and a clean signal-only architecture. The removal of martingale makes it suitable for prop-firm environments and FIFO/netting brokers.
+**OneMinuteMan v10.14** is a technically sophisticated, well-documented MT4 scalping EA with fixed linear risk, comprehensive persistent risk controls, and a clean signal-only architecture. v10.14 adds an ADX regime filter and rolling win-rate tracker, directly addressing the two highest-priority gaps identified by an independent code audit. Suitable for prop-firm environments and FIFO/netting brokers.
 
 ### Summary
 
 | Aspect | Rating | Notes |
 |---|---|---|
-| **Architecture** | ⭐⭐⭐⭐⭐ | Clean OOP, 13 SRP components, zero globals |
+| **Architecture** | ⭐⭐⭐⭐⭐ | Clean OOP, 15 SRP components, zero globals |
 | **Risk Management** | ⭐⭐⭐⭐⭐ | Fixed risk, daily caps, persistent state, ATR-adaptive |
 | **Code Quality** | ⭐⭐⭐⭐⭐ | Bug-fix documentation, guard clauses, input validation |
-| **Documentation** | ⭐⭐⭐⭐ | Clear README, comprehensive SWOT, but no official backtest results |
+| **Documentation** | ⭐⭐⭐⭐ | Clear README, comprehensive SWOT, preset profiles, but no official backtest results |
 | **Backtesting** | ⭐⭐ | No `.set` profiles or walk-forward results provided |
 | **FIFO Compatibility** | ⭐⭐⭐⭐ | Designed for FIFO/netting; needs live broker validation |
 
@@ -354,9 +379,11 @@ The EA can optionally open a reverse-direction position **after a losing close**
 
 - **Repository**: [nhasibuan/g](https://github.com/nhasibuan/g)
 - **Author**: [Norman Hasibuan (@nhasibuan)](https://github.com/nhasibuan)
-- **Latest Version**: v10.13 (July 26, 2026) — martingale removed; signal-only with event-driven loss-reversal; post-audit fixes applied
+- **Latest Version**: v10.14 (July 27, 2026) — ADX filter, performance tracker, preset profiles, MIT license
+- **License**: [MIT](LICENSE)
+- **Contributing**: [CONTRIBUTING.md](CONTRIBUTING.md)
 - **For Issues/Questions**: Refer to repository documentation and risk warnings
 
 ---
 
-*OneMinuteMan v10.13 is a disciplined, signal-only M1 scalper. Fixed risk per trade. No martingale. No compounding. 50 configurable inputs. 11 serial entry guards. Demo thoroughly and trade responsibly.*
+*OneMinuteMan v10.14 is a disciplined, signal-only M1 scalper. Fixed risk per trade. No martingale. No compounding. 57 configurable inputs. 15 SRP classes. 12 serial entry guards. Demo thoroughly and trade responsibly.*

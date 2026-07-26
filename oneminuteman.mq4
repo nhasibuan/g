@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, nhasibuan"
 #property link      "https://github.com/nhasibuan/g"
-#property version   "10.13"
+#property version   "10.14"
 #property strict
 #property description "OneMinuteMan v10.13: Signal-only M1 scalper with event-driven loss-reversal."
 #property description "No martingale. Fixed linear risk. FIFO/netting compatible."
@@ -161,11 +161,28 @@ input int    InpTzOffsetHours    = 7;
 input int    InpSessionStartHour = 5;
 input int    InpSessionEndHour   = 24;
 
+//--- ADX Regime Filter (v10.14)
+//    Blocks entry when market is choppy (ADX below threshold).
+//    Highest-ROI opportunity from independent code audit.
+input bool   InpUseAdxFilter  = true;  // Enable ADX trend-strength filter
+input int    InpAdxPeriod     = 14;    // ADX period
+input double InpAdxThreshold  = 20.0; // Min ADX value to allow fresh entry
+
+//--- Performance Tracker \u0026 Win-Rate Halt (v10.14)
+//    Tracks rolling win-rate; halts trading if win-rate falls below threshold.
+//    Also writes per-trade CSV log to terminal/Files folder.
+input bool   InpUseWinRateHalt      = false; // Halt if rolling win-rate falls below InpMinWinRate
+input int    InpWinRateWindow        = 20;   // Trades in rolling win-rate window
+input double InpMinWinRate           = 0.45; // Minimum acceptable win-rate (0.45 = 45%)
+
+//--- Reversal Safety (v10.14)
+input int    InpReversalArmTimeoutSec = 300; // 0=off; auto-disarm reversal if unfired after N seconds
+
 //==================================================================
 // SECTION 2 -- CONSTANTS, STRUCTURES & UTILITIES
 //==================================================================
 #define MAX_POSITIONS 20
-#define STATE_MAGIC   0x4F4D4D35 // "OMM5" -- v10.13 state format tag (bumped from OMM4)
+#define STATE_MAGIC   0x4F4D4D36 // "OMM6" -- v10.14 state format (adds CPerformanceTracker ring buffer)
 
 const double LONG_BODY_FACTOR   = 1.3;
 const double SHORT_BODY_FACTOR  = 0.5;
@@ -223,11 +240,9 @@ double NormalizeLots(double lots) {
    return NormalizeDouble(MathMin(MathMax(lots, minlot), maxlot), 2);
 }
 
-string TFLabel() {
-   string full = EnumToString((ENUM_TIMEFRAMES)_Period);
-   StringReplace(full, "PERIOD_", "");
-   return full;
-}
+// W11 fix: the EA forces PERIOD_M1 regardless of chart timeframe.
+// Always report "M1 (forced)" so the on-chart panel is never misleading.
+string TFLabel() { return "M1 (forced)"; }
 
 string PpmZoneName(PPM_ZONE z) {
    switch(z) {
@@ -570,7 +585,43 @@ public:
 };
 
 //==================================================================
+// SECTION 7b -- CAdxFilter : ADX trend-strength regime filter (v10.14)
+//==================================================================
+// Prevents entries in choppy/sideways markets where M1 signals have
+// lower win rate. ADX < threshold → block fresh entry.
+// Addresses W9 (no ADX filter) and T4 (choppy market losses) from audit.
+class CAdxFilter {
+private:
+   bool   m_enabled;
+   int    m_period;
+   double m_threshold;
+
+public:
+   void Init(bool enabled, int period, double threshold) {
+      m_enabled   = enabled;
+      m_period    = (period > 0) ? period : 14;
+      m_threshold = (threshold > 0.0) ? threshold : 20.0;
+   }
+
+   // Returns true when market is sufficiently directional (or filter disabled).
+   // Passes when ADX indicator not ready (insufficient bars) to avoid false blocks.
+   bool IsDirectional() {
+      if(!m_enabled) return true;
+      double adx = iADX(Symbol(), PERIOD_M1, m_period, PRICE_CLOSE, MODE_MAIN, 1);
+      if(adx <= 0.0 || adx == EMPTY_VALUE) return true; // not ready: pass
+      return (adx >= m_threshold);
+   }
+
+   double Value() {
+      if(!m_enabled) return 0.0;
+      double adx = iADX(Symbol(), PERIOD_M1, m_period, PRICE_CLOSE, MODE_MAIN, 1);
+      return (adx == EMPTY_VALUE) ? 0.0 : adx;
+   }
+};
+
+//==================================================================
 // SECTION 8 -- CSessionClock : timezone / session / day stamp
+
 //==================================================================
 class CSessionClock {
 private:
@@ -1040,7 +1091,102 @@ public:
 };
 
 //==================================================================
+// SECTION 13b -- CPerformanceTracker : rolling win-rate & CSV log (v10.14)
+//==================================================================
+// Closes W6 (no win-rate gate at code level) and O3/O4 (CPerformanceTracker,
+// win-rate auto-halt) from the independent audit.
+// - Maintains circular buffer of last N trade profits.
+// - Exposes WinRate() and ShouldHalt(minWinRate).
+// - Appends a CSV line to OMM_Trades_<SYMBOL>_<MAGIC>.csv per close.
+#define PERF_MAX_WINDOW 200
+
+class CPerformanceTracker {
+private:
+   double m_results[PERF_MAX_WINDOW]; // ring buffer of profit values
+   int    m_window;   // configured window size
+   int    m_index;    // next write position in ring
+   int    m_count;    // filled entries (caps at m_window)
+   string m_csv_file;
+   bool   m_enabled;
+
+public:
+   void Init(bool enabled, int window, int magic) {
+      m_enabled = enabled;
+      m_window  = (window > 0 && window <= PERF_MAX_WINDOW) ? window : 20;
+      m_index   = 0;
+      m_count   = 0;
+      m_csv_file = "OMM_Trades_" + Symbol() + "_" + IntegerToString(magic) + ".csv";
+      ArrayInitialize(m_results, 0.0);
+      if(m_enabled) EnsureCsvHeader();
+   }
+
+   // Call after every position close.
+   void RecordClose(double profit, int dir, double lots) {
+      // Update ring buffer
+      m_results[m_index] = profit;
+      m_index = (m_index + 1) % m_window;
+      if(m_count < m_window) m_count++;
+      // CSV log (always written, even when win-rate halt is off)
+      if(m_enabled) {
+         int h = FileOpen(m_csv_file, FILE_WRITE | FILE_READ | FILE_CSV | FILE_SHARE_READ);
+         if(h != INVALID_HANDLE) {
+            FileSeek(h, 0, SEEK_END);
+            FileWrite(h,
+               TimeToString(TimeCurrent(), TIME_DATE | TIME_MINUTES),
+               Symbol(),
+               (dir > 0) ? "BUY" : "SELL",
+               DoubleToString(lots, 2),
+               DoubleToString(profit, 2),
+               DoubleToString(WinRate() * 100.0, 1) + "%"
+            );
+            FileClose(h);
+         }
+      }
+   }
+
+   double WinRate() {
+      if(m_count == 0) return 1.0; // no data → don't block
+      int wins = 0;
+      for(int i = 0; i < m_count; i++) wins += (m_results[i] > 0.0) ? 1 : 0;
+      return (double)wins / (double)m_count;
+   }
+
+   // Returns true only when buffer is full AND win-rate is below threshold.
+   bool ShouldHalt(double minWinRate) {
+      if(!m_enabled || minWinRate <= 0.0) return false;
+      if(m_count < m_window) return false; // buffer not yet full: give EA time to prove itself
+      return (WinRate() < minWinRate);
+   }
+
+   int Count()      { return m_count; }
+   int WindowSize() { return m_window; }
+
+   // State persistence: copy ring buffer out/in
+   void GetState(int &idx, int &cnt, double &buf[]) {
+      idx = m_index;
+      cnt = m_count;
+      ArrayCopy(buf, m_results, 0, 0, m_window);
+   }
+   void SetState(int idx, int cnt, const double &buf[], int sz) {
+      m_index = (idx >= 0 && idx < m_window) ? idx : 0;
+      m_count = (cnt >= 0 && cnt <= m_window) ? cnt : 0;
+      int n = (sz < m_window) ? sz : m_window;
+      for(int i = 0; i < n; i++) m_results[i] = buf[i];
+   }
+
+private:
+   void EnsureCsvHeader() {
+      if(FileIsExist(m_csv_file)) return;
+      int h = FileOpen(m_csv_file, FILE_WRITE | FILE_CSV);
+      if(h == INVALID_HANDLE) return;
+      FileWrite(h, "DateTime", "Symbol", "Dir", "Lots", "Profit", "WinRate");
+      FileClose(h);
+   }
+};
+
+//==================================================================
 // SECTION 14 -- CStateStore : versioned binary persistence (Memento)
+
 //==================================================================
 // v10.13: Martingale fields removed. Loss-reversal state added.
 // Format: OMM5 (0x4F4D4D35). Old OMM4 files safely discarded.
@@ -1059,7 +1205,8 @@ public:
    void Save(CVirtualStopManager &vsl,
              bool halted, datetime haltUntil, double dayBaseline, int dayStamp,
              int reversalLossesToday, int tradesToday,
-             datetime lastLossCloseTime, bool reversalPending, int reversalDir) {
+             datetime lastLossCloseTime, bool reversalPending, int reversalDir,
+             CPerformanceTracker &perf) {
       int h = FileOpen(m_filename, FILE_WRITE | FILE_BIN);
       if(h == INVALID_HANDLE) {
          Print("SaveState: cannot open ", m_filename, " err=", GetLastError());
@@ -1079,19 +1226,30 @@ public:
       FileWriteInteger(h, reversalDir);
       // virtual stop manager
       vsl.WriteTo(h);
+      // performance tracker ring buffer (v10.14)
+      int   pidx = 0, pcnt = 0;
+      double pbuf[PERF_MAX_WINDOW];
+      ArrayInitialize(pbuf, 0.0);
+      perf.GetState(pidx, pcnt, pbuf);
+      FileWriteInteger(h, perf.WindowSize());
+      FileWriteInteger(h, pidx);
+      FileWriteInteger(h, pcnt);
+      int w = perf.WindowSize();
+      for(int i = 0; i < w; i++) FileWriteDouble(h, pbuf[i]);
       FileClose(h);
    }
 
    bool Load(CVirtualStopManager &vsl,
              bool &halted, datetime &haltUntil, double &dayBaseline, int &dayStamp,
              int &reversalLossesToday, int &tradesToday,
-             datetime &lastLossCloseTime, bool &reversalPending, int &reversalDir) {
+             datetime &lastLossCloseTime, bool &reversalPending, int &reversalDir,
+             CPerformanceTracker &perf) {
       int h = FileOpen(m_filename, FILE_READ | FILE_BIN);
       if(h == INVALID_HANDLE) return false;
       int tag = FileReadInteger(h);
       if(tag != STATE_MAGIC) {
          FileClose(h);
-         Print("State file has old/unknown format (expected OMM5) -- starting fresh.");
+         Print("State file has old/unknown format (expected OMM6) -- starting fresh.");
          return false;
       }
       // equity guard state
@@ -1107,10 +1265,20 @@ public:
       reversalDir         = FileReadInteger(h);
       // virtual stop manager
       vsl.ReadFrom(h);
+      // performance tracker ring buffer (v10.14)
+      int    saved_window = FileReadInteger(h);
+      int    pidx         = FileReadInteger(h);
+      int    pcnt         = FileReadInteger(h);
+      double pbuf[PERF_MAX_WINDOW];
+      ArrayInitialize(pbuf, 0.0);
+      int n = (saved_window <= PERF_MAX_WINDOW) ? saved_window : PERF_MAX_WINDOW;
+      for(int i = 0; i < n; i++) pbuf[i] = FileReadDouble(h);
+      perf.SetState(pidx, pcnt, pbuf, n);
       FileClose(h);
       return true;
    }
 };
+
 
 //==================================================================
 // SECTION 15 -- CExpertAdvisor : Facade wiring all components
@@ -1124,12 +1292,14 @@ private:
    CCandleEngine         m_candle_engine;
    CPpmEngine            m_ppm_engine;
    CVolumeFilter         m_volume;
+   CAdxFilter            m_adx;         // v10.14: ADX regime filter
    CSessionClock         m_clock;
    CEquityGuard          m_guard;
    CRiskModel            m_risk;
    CVirtualStopManager   m_vsl;
    CTrailingManager      m_trailing;
    CTradeExecutor        m_exec;
+   CPerformanceTracker   m_perf;        // v10.14: rolling win-rate tracker
    CStateStore           m_store;
 
    CANDLE_STRUCTURE m_candle;
@@ -1141,6 +1311,7 @@ private:
    datetime         m_halt_until;
    bool             m_initialized;
    datetime         m_last_bar_time;
+   datetime         m_last_comment_time; // v10.14: rate-limit UpdateComment to 1 Hz
 
    // v10.13 loss-reversal state
    bool             m_reversal_pending;   // armed after a losing close
@@ -1154,7 +1325,8 @@ private:
       m_store.Save(m_vsl, m_halted, m_halt_until,
                    m_guard.Baseline(), m_guard.DayStamp(),
                    m_reversal_losses_today, m_trades_today,
-                   m_last_loss_close_time, m_reversal_pending, m_reversal_dir);
+                   m_last_loss_close_time, m_reversal_pending, m_reversal_dir,
+                   m_perf);
    }
 
    void HaltForToday(string reason) {
@@ -1192,10 +1364,18 @@ private:
    void UpdateTradeState() {
       int n = m_exec.CountPositions();
       if(n == 0 && m_had_pos) {
-         // A position just closed -- check if it was a loss
+         // Record the close in the performance tracker (v10.14)
          double closePx = 0.0;
          double profit  = m_exec.LastClosedProfit(closePx);
          int    lastDir = m_exec.LastClosedDir();
+         double lastLots = NormalizeLots(InpBaseLots); // approximate; CTradeExecutor tracks exact
+         m_perf.RecordClose(profit, lastDir, lastLots);
+
+         // Win-rate auto-halt check (v10.14)
+         if(InpUseWinRateHalt && m_perf.ShouldHalt(InpMinWinRate)) {
+            HaltForToday(StringFormat("win-rate %.0f%% < %.0f%% over %d trades",
+               m_perf.WinRate() * 100.0, InpMinWinRate * 100.0, m_perf.WindowSize()));
+         }
 
          if(profit < 0.0) {
             // Track reverse-leg losses separately
@@ -1241,6 +1421,16 @@ private:
    void ManageReverseEntry() {
       if(!InpEnableLossReversal || !InpEnableTrading) return;
       if(!m_reversal_pending)                         return;
+
+      // v10.14: Auto-disarm if reversal was armed but never fired within timeout
+      if(InpReversalArmTimeoutSec > 0 &&
+         TimeCurrent() - m_last_loss_close_time > InpReversalArmTimeoutSec) {
+         m_reversal_pending = false;
+         Print("Loss-reversal auto-disarmed: timeout ", InpReversalArmTimeoutSec, "s elapsed.");
+         SaveState();
+         return;
+      }
+
       if(m_exec.CountPositions() != 0)               return; // wait for flat
       if(!TradingWindowOpen())                        return;
       if(!m_spread.SpreadOK())                        return;
@@ -1296,7 +1486,8 @@ private:
       return false;
    }
 
-   // v10.13: Fresh signal entry only -- no martingale re-entry path.
+   // v10.14: Fresh signal entry — 12-AND conjunctive gate (was 11).
+   // Gate #12: ADX regime filter blocks entry in choppy markets.
    void ManageEntries(bool allowFresh) {
       if(!InpEnableTrading)              return;
       if(m_exec.CountPositions() > 0)   return; // single-position invariant
@@ -1315,6 +1506,9 @@ private:
       if(m_ppm.zone < PPM_ZONE_MEDIUM)                   return;
       if(!m_volume.Ok())                                  return;
 
+      // Gate #12 (v10.14): ADX regime filter — skip entry in low-ADX chop
+      if(!m_adx.IsDirectional())                         return;
+
       int dir = m_candle_engine.SignalDirection(m_candle);
       if(dir == 0) return;
 
@@ -1326,18 +1520,28 @@ private:
       }
    }
 
+   // v10.14: Rate-limited to 1 Hz to avoid StringFormat on every 50ms timer tick.
    void UpdateComment() {
-      string msg = "=== OneMinuteMan v10.13 (no-mart) ===\n";
-      msg += StringFormat("Symbol:%-6s  Engines:M1 (forced)  Chart:%s\n", Symbol(), TFLabel());
+      datetime now = TimeCurrent();
+      if(now == m_last_comment_time) return; // skip if already updated this second
+      m_last_comment_time = now;
+
+      string msg = "=== OneMinuteMan v10.14 (no-mart) ===\n";
+      msg += StringFormat("Symbol:%-6s  Engine:%s\n", Symbol(), TFLabel());
       msg += "--- Range ---\n";
       msg += StringFormat("High:%.5f  Low:%.5f  Range:%.5f\n",
                           m_range.High(), m_range.Low(), m_range.Range());
-      msg += "--- Candle ---\n";
+      msg += "--- Signal ---\n";
       if(m_candle_valid)
          msg += StringFormat("Pattern:%s Trend:%s\n",
                              CandleTypeName(m_candle.type), TrendName(m_candle.unit));
       if(InpShowPPM && m_ppm_valid)
          msg += StringFormat("PPM:%.2f  Zone:%s\n", m_ppm.ppm, PpmZoneName(m_ppm.zone));
+      if(InpUseAdxFilter)
+         msg += StringFormat("ADX:%.1f %s (thr:%.0f)\n",
+                             m_adx.Value(),
+                             m_adx.IsDirectional() ? "OK" : "CHOP",
+                             InpAdxThreshold);
       msg += "--- Trade ---\n";
       msg += StringFormat("Trading:%s  Spread:%d/%d  Equity:$%.2f  DD:%.2f%%\n",
                           InpEnableTrading ? "ON" : "OFF",
@@ -1348,6 +1552,12 @@ private:
                           m_trades_today,
                           (InpMaxTradesPerDay > 0)
                              ? StringFormat("/%d", InpMaxTradesPerDay) : "");
+      // Win-rate row (v10.14)
+      if(m_perf.Count() > 0)
+         msg += StringFormat("WinRate:%.0f%% (%d/%d)%s\n",
+                             m_perf.WinRate() * 100.0,
+                             m_perf.Count(), m_perf.WindowSize(),
+                             InpUseWinRateHalt ? StringFormat(" min:%.0f%%", InpMinWinRate*100.0) : "");
       // Loss-reversal status
       msg += StringFormat("Reversal:%s  Confirm:%s\n",
                           InpEnableLossReversal ? "ON" : "OFF",
@@ -1380,7 +1590,8 @@ public:
       m_had_pos      = false;
       m_halted       = false;
       m_halt_until   = 0;
-      m_last_bar_time = 0;
+      m_last_bar_time     = 0;
+      m_last_comment_time = 0; // v10.14
 
       // v10.13 loss-reversal state init
       m_reversal_pending      = false;
@@ -1413,6 +1624,7 @@ public:
       m_ppm_engine.Init(InpZzDepth, InpZzDeviation, InpZzBackstep, InpZzLookback,
                         InpPpmMinHigh, InpPpmTarget, InpAtrDailyRef);
       m_volume.Init(InpUseVolumeFilter, InpVolLookback, InpVolMultiplier);
+      m_adx.Init(InpUseAdxFilter, InpAdxPeriod, InpAdxThreshold);  // v10.14
       m_clock.Init(InpTzOffsetHours, InpSessionStartHour, InpSessionEndHour);
       m_guard.Init(InpMinEquity, InpMaxDrawdownPct);
       m_risk.Init(InpAtrPeriod, InpAtrSLMult, InpAtrTPMult,
@@ -1421,6 +1633,7 @@ public:
       m_vsl.Init(InpHideSL);
       m_trailing.Init(InpHideSL, InpBE_LockPips);
       m_exec.Init(InpMagic, InpHideSL, InpUseSafetySL, InpSafetySLMult, InpBE_LockPips);
+      m_perf.Init(true, InpWinRateWindow, InpMagic);               // v10.14 (CSV always on)
       m_store.Init(InpMagic);
 
       if(!m_ppm_engine.VerifyIndicator()) {
@@ -1440,7 +1653,7 @@ public:
       int      revDir    = 0;
 
       if(m_store.Load(m_vsl, halted, haltUntil, baseline, dayStamp,
-                      revLosses, trades, llct, revPend, revDir)) {
+                      revLosses, trades, llct, revPend, revDir, m_perf)) {
          int today = m_clock.LocalDayStamp();
          if(dayStamp == today && baseline > 0.0) {
             m_guard.SetBaseline(baseline, dayStamp);
@@ -1461,11 +1674,12 @@ public:
             m_trades_today          = 0;
             m_reversal_pending      = false;
          }
-         Print("State recovered (OMM5): VSLs=", m_vsl.Count(),
+         Print("State recovered (OMM6): VSLs=", m_vsl.Count(),
                " RevPending=", m_reversal_pending ? "yes" : "no",
                " RevLosses=", m_reversal_losses_today,
-               " Trades=", m_trades_today);
-      } else {
+               " Trades=", m_trades_today,
+               " WinRate=", DoubleToString(m_perf.WinRate()*100.0,0), "%");
+   } else {
          m_guard.ResetBaseline(m_clock.LocalDayStamp());
       }
 
@@ -1475,7 +1689,9 @@ public:
          { Print("Error: Timer failed"); return INIT_FAILED; }
 
       m_initialized = true;
-      Print("OneMinuteMan v10.13 (no-mart) initialized successfully.");
+      Print("OneMinuteMan v10.14 (no-mart) initialized. ADX:", InpUseAdxFilter?"ON":"OFF",
+            " WinRateHalt:", InpUseWinRateHalt?"ON":"OFF",
+            " ReversalTimeout:", InpReversalArmTimeoutSec, "s");
       return INIT_SUCCEEDED;
    }
 

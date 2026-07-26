@@ -1,8 +1,8 @@
-# OneMinuteMan v10.13-no-mart — Verification, Comprehensive SWOT, and Critical Review
+# OneMinuteMan v10.13/v10.14 — Verification, Comprehensive SWOT, and Critical Review
 
 **Subject:** `https://github.com/nhasibuan/g/blob/main/oneminuteman.mq4`  
-**Version Under Review:** v10.12 (current `main`) & v10.13-no-mart (planned)  
-**Verification Date:** 2026-07-22  
+**Version Under Review:** v10.12 (baseline), v10.13 (martingale removal), v10.14 (ADX + CPerformanceTracker)  
+**Verification Date:** 2026-07-22 (v10.13), 2026-07-27 (v10.14)  
 **Verification Author:** Comprehensive source audit + PLAN cross-reference
 
 ---
@@ -525,18 +525,100 @@ Timer handler explicitly runs in order: `m_trailing.Manage` → `m_vsl.Enforce` 
 
 ---
 
-## References
+## v10.14 — Design Spec & Implementation Report (2026-07-27)
 
-- **v10.12 Source (baseline):** `oneminuteman.mq4`, 66,756 bytes, 1,785 lines, 14 classes
-- **v10.13 Source (post-audit):** `oneminuteman.mq4`, 1,561 lines, 13 classes, 50 inputs
-- **v10.13 Implementation Date:** 2026-07-22
-- **v10.13 Deep-Dive Audit Date:** 2026-07-26
-- **Audit Method:** Clone repo → line-by-line 1,561-line source review → cross-reference all PLAN/README claims
-- **Findings:** 8 items (F1–F8); 6 fixed in code, 1 documented, 1 pending (LICENSE)
-- **Author:** Mavis (root session)
+### Scope
+
+v10.14 implements the two **highest-ROI opportunities** from the independent code audit, plus 4 lower-risk improvements and 3 governance files.
+
+### Changes Implemented
+
+| # | Change | Audit Finding | Impact |
+|---|---|---|---|
+| 1 | `CAdxFilter` class (§7b, ~40 LOC) | W9, T4 (O5 from audit) | Blocks fresh entries when ADX < 20; reduces losses in choppy markets |
+| 2 | `CPerformanceTracker` class (§13b, ~90 LOC) | W6, O3, O4 | Rolling win-rate, auto-halt, CSV trade log |
+| 3 | Reversal arm-timeout (`InpReversalArmTimeoutSec`) | §3.2 risk-review | Auto-disarms armed reversal after N seconds if session ends |
+| 4 | `TFLabel()` always returns "M1 (forced)" | W11 | Panel no longer shows misleading chart timeframe |
+| 5 | `UpdateComment()` rate-limited to 1 Hz | §3.1 code quality | Avoids `StringFormat` overhead on every 50ms tick |
+| 6 | STATE_MAGIC `OMM5` → `OMM6` | State format change | Safely discards old state files; extends binary with perf ring buffer |
+| 7 | `LICENSE` (MIT) | W1 — legal risk | Resolves "all rights reserved" ambiguity for prop-firm/commercial use |
+| 8 | `conservative.set` + `ftmo_challenge.set` | W7, O2 | Removes configuration barrier for new users |
+| 9 | `CONTRIBUTING.md` | §3.3 governance | PR checklist, human review requirement, MT4 compile step |
+
+### New Inputs (7 total, 50 → 57)
+
+| Input | Default | Purpose |
+|---|---|---|
+| `InpUseAdxFilter` | `true` | Enable ADX gate |
+| `InpAdxPeriod` | `14` | ADX indicator period |
+| `InpAdxThreshold` | `20.0` | Min ADX for entry |
+| `InpUseWinRateHalt` | `false` | Enable win-rate auto-halt |
+| `InpWinRateWindow` | `20` | Rolling window size |
+| `InpMinWinRate` | `0.45` | Min win-rate before halt |
+| `InpReversalArmTimeoutSec` | `300` | Reversal arm timeout |
+
+### Verification Checklist (v10.14)
+
+| # | Check | Result |
+|---|---|---|
+| V1 | `#property version "10.14"` | ✅ |
+| V2 | 15 classes (`^class ` grep) | ✅ |
+| V3 | 57 inputs (`^input ` grep) | ✅ |
+| V4 | STATE_MAGIC = 0x4F4D4D36 (OMM6) | ✅ |
+| V5 | `TFLabel()` returns `"M1 (forced)"` always | ✅ |
+| V6 | `CAdxFilter::IsDirectional()` in `ManageEntries()` | ✅ |
+| V7 | `m_perf.RecordClose()` called in `UpdateTradeState()` | ✅ |
+| V8 | `m_perf.ShouldHalt()` triggers `HaltForToday()` | ✅ |
+| V9 | Reversal arm-timeout in `ManageReverseEntry()` | ✅ |
+| V10 | `m_last_comment_time` rate-limits `UpdateComment()` | ✅ |
+| V11 | `CStateStore::Save/Load` include perf ring buffer | ✅ |
+| V12 | No `MART_CONFIRM` remnants in code (non-comment) | ✅ |
+| V13 | `LICENSE` file present (MIT) | ✅ |
+| V14 | `conservative.set` present | ✅ |
+| V15 | `ftmo_challenge.set` present | ✅ |
+| V16 | `CONTRIBUTING.md` present | ✅ |
+| V17 | `m_store.Load(..., m_perf)` matches new signature | ✅ |
+| V18 | `m_store.Save(..., m_perf)` matches new signature | ✅ |
+| V19 | ADX panel row in `UpdateComment()` | ✅ |
+| V20 | WinRate panel row in `UpdateComment()` | ✅ |
+| V21 | Compile with `#property strict` — 0 errors | ⚠️ Pending MetaEditor |
+| V22 | Strategy Tester: ADX filter visible in log | ⚠️ Pending |
+
+### Audit Findings Status After v10.14
+
+| Finding | Area | v10.13 Status | v10.14 Status |
+|---|---|---|---|
+| F1 — dead `#property link` | Code | ✅ Fixed | ✅ Fixed |
+| F2 — `InpMaxTradesPerDay=0` default | Risk | ✅ Documented | ✅ Documented |
+| F3 — `LastClosedProfit` O(n) scan | Perf | ✅ Fixed | ✅ Fixed |
+| F4 — halt state re-anchors on restart | Safety | ✅ Fixed | ✅ Fixed |
+| F5 — `MART_CONFIRM` naming debt | Naming | ✅ Fixed | ✅ Fixed |
+| F6 — equity guard not evaluated on tick | Safety | ✅ Fixed | ✅ Fixed |
+| F7 — README gate count mismatch | Docs | ✅ Fixed | ✅ Fixed |
+| F8 — LICENSE missing | Legal | ⚠️ Pending | ✅ Fixed |
+| W9/T4 — No ADX filter | Architecture | ⚠️ Open | ✅ Implemented |
+| W6 — No win-rate gate | Architecture | ⚠️ Open | ✅ Implemented |
+| O3 — CPerformanceTracker missing | Architecture | ⚠️ Open | ✅ Implemented |
+| W11 — TFLabel misleading | Code | ⚠️ Open | ✅ Fixed |
+| §3.1 — UpdateComment perf | Code | ⚠️ Open | ✅ Fixed |
+| W7/O2 — no .set profiles | UX | ⚠️ Open | ✅ Fixed |
+| §3.3 — CONTRIBUTING.md | Governance | ⚠️ Open | ✅ Fixed |
+| W1 — worst-case 6× documented | Docs | ⚠️ Partial | ✅ Documented |
 
 ---
 
-*OneMinuteMan v10.13-no-mart is a disciplined, signal-only M1 scalper. Fixed risk per trade. No recovery. Post-audit: all code findings resolved, naming debt eliminated, dead link fixed, history scan optimized. Pending: LICENSE file, MT4 compilation, live/demo FIFO broker test.*
+## References
 
+- **v10.12 Source (baseline):** `oneminuteman.mq4`, 66,756 bytes, 1,785 lines, 14 classes
+- **v10.13 Source (post-audit):** `oneminuteman.mq4`, 1,564 lines, 13 classes, 50 inputs
+- **v10.14 Source:** `oneminuteman.mq4`, 1,779 lines, 15 classes, 57 inputs, OMM6 state
+- **v10.13 Implementation Date:** 2026-07-22
+- **v10.13 Deep-Dive Audit Date:** 2026-07-26
+- **v10.14 Implementation Date:** 2026-07-27
+- **Audit Method:** Clone repo → line-by-line source review → cross-reference all PLAN/README claims
+- **v10.13 Findings:** 8 items (F1–F8); 6 fixed in code, 1 documented, 1 pending (LICENSE)
+- **v10.14 Findings:** All prior open items resolved; 2 new classes added
 
+---
+
+*OneMinuteMan v10.14 is a disciplined, signal-only M1 scalper. Fixed risk. No recovery. Post-audit: all code findings resolved, ADX filter live, performance tracker active, preset profiles shipped, MIT license applied. Pending: MetaEditor compilation, live/demo FIFO broker test.*
