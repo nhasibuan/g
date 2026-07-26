@@ -146,7 +146,7 @@ The EA can optionally open a reverse-direction position **after a losing close**
 | **S10** | **ATR-adaptive risk** | SL/TP/trail/BE scale with market volatility automatically. |
 | **S11** | **Clean SRP decomposition** | 13 classes, each with one named responsibility; easy to swap components. |
 | **S12** | **No DLL, no external lib** | Pure single-file MQL4; one file deployment. |
-| **S13** | **Reversal confirmation gate** | `ENUM_MART_CONFIRM` reused to filter reverse entries by candle/PPM signals. |
+| **S13** | **Reversal confirmation gate** | `ENUM_REVERSE_CONFIRM` filters reverse entries by candle/PPM signals. |
 | **S14** | **Daily limits on reversals** | `InpMaxReverseLossesPerDay` and `InpMaxTradesPerDay` bound worst-case exposure. |
 
 ### Weaknesses (12 Items)
