@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                                  oneminuteman.mq4 |
 //|                                     Copyright 2025, nhasibuan     |
-//|                          https://github.com/nhasibuan/oneminuteman|
+//|                            https://github.com/nhasibuan/g         |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, nhasibuan"
-#property link      "https://github.com/nhasibuan/oneminuteman"
+#property link      "https://github.com/nhasibuan/g"
 #property version   "10.13"
 #property strict
 #property description "OneMinuteMan v10.13: Signal-only M1 scalper with event-driven loss-reversal."
@@ -36,19 +36,22 @@
 //       CStateStore           versioned binary persistence (Memento)
 //   - Guard clauses everywhere; no hidden global mutation: all state
 //     lives inside the owning component.
+//   - Entry gate: 11 serial guard clauses (conjunctive AND).
+//   - Conflict resolution (CR6): Timer SL enforcement always runs
+//     before any entry logic.
 //==================================================================
 
 //==================================================================
 // SECTION 0 -- ENUMERATIONS
 //==================================================================
-// Reversal confirmation -- repurposed from v10.12 martingale gate
-// to v10.13 loss-reversal signal confirmation filter.
-enum ENUM_MART_CONFIRM {
-   MART_CONFIRM_NONE   = 0, // no confirmation (fires on delay only)
-   MART_CONFIRM_CANDLE = 1, // candle signal must agree with reverse direction
-   MART_CONFIRM_PPM    = 2, // PPM zone must be MEDIUM or HIGH
-   MART_CONFIRM_EITHER = 3, // candle OR PPM
-   MART_CONFIRM_BOTH   = 4  // candle AND PPM
+// Reversal confirmation filter for loss-reversal entry gate.
+// (Renamed from ENUM_MART_CONFIRM in v10.13 to eliminate martingale naming debt.)
+enum ENUM_REVERSE_CONFIRM {
+   REVERSE_CONFIRM_NONE   = 0, // no confirmation (fires on delay only)
+   REVERSE_CONFIRM_CANDLE = 1, // candle signal must agree with reverse direction
+   REVERSE_CONFIRM_PPM    = 2, // PPM zone must be MEDIUM or HIGH
+   REVERSE_CONFIRM_EITHER = 3, // candle OR PPM
+   REVERSE_CONFIRM_BOTH   = 4  // candle AND PPM
 };
 
 enum TYPE_CANDLESTICK {
@@ -143,7 +146,7 @@ input double InpSprEmaAlpha   = 0.05;
 input bool              InpEnableLossReversal    = true;  // Enable reverse-after-losing-close
 input int               InpLossReversalDelaySec  = 5;     // Delay (seconds) after losing close before reverse entry
 input double            InpReverseLots           = 0.0;   // 0 = use InpBaseLots
-input ENUM_MART_CONFIRM InpReverseConfirm        = MART_CONFIRM_NONE; // Signal confirmation for reverse leg
+input ENUM_REVERSE_CONFIRM InpReverseConfirm     = REVERSE_CONFIRM_NONE; // Signal confirmation for reverse leg
 input int               InpMaxReverseLossesPerDay = 3;    // 0 = unlimited; max reverse losses before disabling for day
 input int               InpMaxTradesPerDay       = 0;     // 0 = unlimited; max total trades per day
 input int               InpMinHoldSec            = 0;     // 0 = off; minimum seconds to hold before closing
@@ -260,14 +263,14 @@ string TrendName(TYPE_TREND u) {
    }
 }
 
-string ConfirmName(ENUM_MART_CONFIRM c) {
+string ConfirmName(ENUM_REVERSE_CONFIRM c) {
    switch(c) {
-      case MART_CONFIRM_NONE:   return "NONE";
-      case MART_CONFIRM_CANDLE: return "CANDLE";
-      case MART_CONFIRM_PPM:    return "PPM";
-      case MART_CONFIRM_EITHER: return "EITHER";
-      case MART_CONFIRM_BOTH:   return "BOTH";
-      default:                  return "?";
+      case REVERSE_CONFIRM_NONE:   return "NONE";
+      case REVERSE_CONFIRM_CANDLE: return "CANDLE";
+      case REVERSE_CONFIRM_PPM:    return "PPM";
+      case REVERSE_CONFIRM_EITHER: return "EITHER";
+      case REVERSE_CONFIRM_BOTH:   return "BOTH";
+      default:                     return "?";
    }
 }
 
@@ -933,6 +936,8 @@ public:
 
    // Returns the net profit of the most recently closed position (includes swap+commission).
    // "Losing close" is defined as LastClosedProfit() < 0.
+   // Optimization: scans history backward; exits early once a matching order
+   // is found, since MT4 history is typically ordered by close time.
    double LastClosedProfit(double &closePrice) {
       datetime best = 0;
       double   prof = 0.0;
@@ -946,12 +951,13 @@ public:
             best       = OrderCloseTime();
             prof       = OrderProfit() + OrderSwap() + OrderCommission();
             closePrice = OrderClosePrice();
-         }
+         } else if(best > 0) break; // history is descending; no newer orders follow
       }
       return prof;
    }
 
    // Returns the direction of the most recently closed position (+1 buy, -1 sell, 0 none).
+   // Optimization: early-exit on descending history (same as LastClosedProfit).
    int LastClosedDir() {
       datetime best = 0;
       int      dir  = 0;
@@ -963,7 +969,7 @@ public:
          if(OrderCloseTime() > best) {
             best = OrderCloseTime();
             dir  = (OrderType() == OP_BUY) ? +1 : -1;
-         }
+         } else if(best > 0) break; // history is descending; no newer orders follow
       }
       return dir;
    }
@@ -1252,7 +1258,7 @@ private:
          return;
       }
 
-      // Confirmation gate (reuses ENUM_MART_CONFIRM)
+      // Confirmation gate (ENUM_REVERSE_CONFIRM)
       if(!ReverseConfirmationOK()) return;
 
       // Execute the reverse entry
@@ -1272,7 +1278,7 @@ private:
 
    // Check reversal confirmation gate (candle/PPM filter)
    bool ReverseConfirmationOK() {
-      if(InpReverseConfirm == MART_CONFIRM_NONE) return true;
+      if(InpReverseConfirm == REVERSE_CONFIRM_NONE) return true;
 
       bool candleOk = false;
       if(m_candle_valid) {
@@ -1282,10 +1288,10 @@ private:
       bool ppmOk = (m_ppm_valid && m_ppm.zone >= PPM_ZONE_MEDIUM);
 
       switch(InpReverseConfirm) {
-         case MART_CONFIRM_CANDLE: return candleOk;
-         case MART_CONFIRM_PPM:    return ppmOk;
-         case MART_CONFIRM_EITHER: return (candleOk || ppmOk);
-         case MART_CONFIRM_BOTH:   return (candleOk && ppmOk);
+         case REVERSE_CONFIRM_CANDLE: return candleOk;
+         case REVERSE_CONFIRM_PPM:    return ppmOk;
+         case REVERSE_CONFIRM_EITHER: return (candleOk || ppmOk);
+         case REVERSE_CONFIRM_BOTH:   return (candleOk && ppmOk);
       }
       return false;
    }

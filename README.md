@@ -44,7 +44,7 @@ The EA is structured as a **single-file component architecture** using classic O
 #### Signal & Market Analysis
 - **`CSpreadMonitor`** — Calculates rolling EMA of bid-ask spread; adaptive max-spread & slippage multipliers (symbol-agnostic)
 - **`CRangeScanner`** — Ring-buffer of tick High/Low samples over 60-second window (1,200 samples @ 50ms intervals)
-- **`CCandleEngine`** — Classifies 10 candlestick types (Hammer, Marubozu, Doji variants, Long/Short, Spinning Top, Inverted Hammer) and derives trend direction vs SMA
+- **`CCandleEngine`** — Classifies 11 candlestick types (Hammer, Marubozu, 3 Doji variants, Long/Short, Spinning Top, Inverted Hammer) and derives trend direction vs SMA
 - **`CPpmEngine`** — Uses ZigZag indicator to compute pips-per-minute efficiency; classifies zones as LOW / MEDIUM / HIGH
 - **`CVolumeFilter`** — Tick-volume spike gate; blocks entries when volume is below threshold to ensure liquidity confirmation
 
@@ -65,16 +65,19 @@ The EA is structured as a **single-file component architecture** using classic O
 
 ### Signal Logic (Entry Conditions)
 
-**All conditions must be true for a fresh entry (8-AND conjunctive gate):**
+**All conditions must be true for a fresh entry (11-AND conjunctive gate):**
 
 1. Trading enabled (`InpEnableTrading = true`)
 2. No open position on the symbol (single-position invariant)
 3. Inside session hours
 4. Spread within adaptive limit
 5. Equity guard passes (min equity + drawdown check)
-6. PPM zone is MEDIUM or HIGH (ZigZag momentum confirmed)
-7. Tick volume ≥ multiplier × average (liquidity spike confirmed)
-8. Candle produces a directional signal (pattern + trend aligned)
+6. No reversal pending (reversal takes priority over fresh entry)
+7. Daily trade limit not reached (`InpMaxTradesPerDay`)
+8. New bar + candle data valid + PPM data valid
+9. PPM zone is MEDIUM or HIGH (ZigZag momentum confirmed)
+10. Tick volume ≥ multiplier × average (liquidity spike confirmed)
+11. Candle produces a directional signal (pattern + trend aligned)
 
 ### Loss-Reversal Engine (v10.13)
 
@@ -294,7 +297,7 @@ The EA can optionally open a reverse-direction position **after a losing close**
 | `InpEnableLossReversal` | `true` | Enable event-driven reverse-after-losing-close |
 | `InpLossReversalDelaySec` | `5` | Seconds to wait after losing close before reverse entry |
 | `InpReverseLots` | `0.0` | Lot size for reverse leg; `0` = use `InpBaseLots` |
-| `InpReverseConfirm` | `MART_CONFIRM_NONE` | Signal confirmation for reverse entry (NONE/CANDLE/PPM/EITHER/BOTH) |
+| `InpReverseConfirm` | `REVERSE_CONFIRM_NONE` | Signal confirmation for reverse entry (NONE/CANDLE/PPM/EITHER/BOTH) |
 | `InpMaxReverseLossesPerDay` | `3` | Max reverse-leg losses per day; `0` = unlimited |
 | `InpMaxTradesPerDay` | `0` | Max total trades per day; `0` = unlimited |
 | `InpMinHoldSec` | `0` | Minimum seconds to hold before closing; `0` = off |
@@ -349,11 +352,11 @@ The EA can optionally open a reverse-direction position **after a losing close**
 
 ## Resources
 
-- **Repository**: [nhasibuan/oneminuteman](https://github.com/nhasibuan/oneminuteman)
+- **Repository**: [nhasibuan/g](https://github.com/nhasibuan/g)
 - **Author**: [Norman Hasibuan (@nhasibuan)](https://github.com/nhasibuan)
-- **Latest Version**: v10.13 (July 22, 2026) — martingale removed; signal-only with event-driven loss-reversal
+- **Latest Version**: v10.13 (July 26, 2026) — martingale removed; signal-only with event-driven loss-reversal; post-audit fixes applied
 - **For Issues/Questions**: Refer to repository documentation and risk warnings
 
 ---
 
-*OneMinuteMan v10.13 is a disciplined, signal-only M1 scalper. Fixed risk per trade. No martingale. No compounding. Demo thoroughly and trade responsibly.*
+*OneMinuteMan v10.13 is a disciplined, signal-only M1 scalper. Fixed risk per trade. No martingale. No compounding. 50 configurable inputs. 11 serial entry guards. Demo thoroughly and trade responsibly.*
