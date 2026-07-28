@@ -62,3 +62,6 @@ InpUseWinRateHalt=1
 InpWinRateWindow=20
 InpMinWinRate=0.45
 InpReversalArmTimeoutSec=180
+InpEnableChopHedge=0
+InpHedgeLots=0.0
+InpMaxHedgeLegs=2

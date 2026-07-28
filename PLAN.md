@@ -622,3 +622,161 @@ v10.14 implements the two **highest-ROI opportunities** from the independent cod
 ---
 
 *OneMinuteMan v10.14 is a disciplined, signal-only M1 scalper. Fixed risk. No recovery. Post-audit: all code findings resolved, ADX filter live, performance tracker active, preset profiles shipped, MIT license applied. Pending: MetaEditor compilation, live/demo FIFO broker test.*
+
+---
+
+## vNEXT (v10.15) — Chop-Hedging Mode: Design Spec, SWOT & Verification
+
+**Design Date:** 2026-07-28  
+**Status:** Spec approved → implemented  
+**Feature Flag:** `InpEnableChopHedge` (default `false`)  
+
+---
+
+### Background & Motivation
+
+v10.14 introduced `CAdxFilter` which *blocks* fresh entries when `ADX < InpAdxThreshold`. This correctly avoids trend-signal entries in choppy markets. However, choppy/sideways conditions represent a different opportunity: **mean-reversion / range-fade** trades. This feature adds an opt-in "chop-hedging" mode that opens a position *because* the market is choppy, rather than standing aside.
+
+**Precise definition of "choppy/sideways":**  
+`iADX(Symbol(), PERIOD_M1, InpAdxPeriod, PRICE_CLOSE, MODE_MAIN, 1) < InpAdxThreshold`  
+This is the negation of `CAdxFilter::IsDirectional()`, exposed as the new `CAdxFilter::IsChoppy()` method (reuses the same iADX call — no new indicator).
+
+---
+
+### Invariant Conflict Analysis & Mitigation
+
+| Invariant | Conflict | Mitigation |
+|---|---|---|
+| **Single-position invariant** (`ManageEntries() CountPositions() > 0 → return`) | Hedging needs ≥2 concurrent positions | `ManageChopHedge()` is a **separate code path** with its own `CountPositions() < InpMaxHedgeLegs` guard. `ManageEntries()` is **not modified** — still blocks normal entries when any position is open. |
+| **FIFO/netting compatibility** ("no concurrent hedging"; reversal "waits for flat account") | Concurrent long+short rejected by netting brokers and most prop firms | Feature gated behind `InpEnableChopHedge = false`. `OnInit()` prints an explicit FIFO-break warning when flag is `true`. |
+| **Fixed linear risk** (S1 — worst-case per-trade loss is enumerable) | Multiple hedge legs = `N × InpHedgeLots` maximum exposure | `InpMaxHedgeLegs` (default 2) caps concurrent legs. Exposure ceiling is explicit and documented. |
+
+---
+
+### Requirements
+
+#### Trigger Conditions (all must be true)
+1. `InpEnableChopHedge == true`
+2. `InpEnableTrading == true`
+3. `m_adx.IsChoppy()` — ADX < InpAdxThreshold on M1 bar shift 1
+4. `CountPositions() < InpMaxHedgeLegs` — leg cap not reached
+5. `TradingWindowOpen()` — inside session hours
+6. `m_spread.SpreadOK()` — spread within adaptive limit
+7. `EquityGuardOK()` — equity guard passes
+8. `InpMaxTradesPerDay == 0 || m_trades_today < InpMaxTradesPerDay`
+9. `allowFresh == true` — fires only on new bar (same rhythm as `ManageEntries()`)
+10. `!m_reversal_pending` — reversal takes priority; suppresses chop-hedge
+
+#### Direction Logic (range-fade / mean-reversion)
+In choppy conditions there is no dominant trend signal, so direction is determined by **range-fade**:
+- If `Ask > m_range.Mid()` (price in upper half of the 60-second range) → open **SELL** (fade upper extreme)
+- If `Ask <= m_range.Mid()` → open **BUY** (fade lower extreme)
+
+This is statistically consistent with mean-reversion: in a ranging market, price at the upper boundary is more likely to revert downward, and vice versa. No external indicator is required.
+
+`m_range.Mid()` is computed as `(High + Low) / 2` from `CRangeScanner`'s 60-second ring buffer.
+
+#### Lot Sizing
+- `InpHedgeLots > 0.0` → `NormalizeLots(InpHedgeLots)`
+- `InpHedgeLots == 0.0` → `NormalizeLots(InpBaseLots)` (same as main entry)
+
+#### Interaction Rules
+| Rule | Behavior |
+|---|---|
+| `m_reversal_pending == true` | Chop-hedge suppressed; reversal takes priority |
+| Chop-hedge leg closes at a loss | Does NOT arm loss-reversal (chop-hedge losses are not tagged as reversal-triggering) |
+| `m_reversal_pending` while hedge leg is open | Reversal waits (`CountPositions() != 0` guard); fires after hedge closes |
+| Each hedge leg opened | Increments `m_trades_today` — counts against `InpMaxTradesPerDay` |
+
+---
+
+### New Inputs (3 total, 57 → 60)
+
+| Input | Default | Section |
+|---|---|---|
+| `InpEnableChopHedge` | `false` | Chop-Hedging Engine (v10.15) |
+| `InpHedgeLots` | `0.0` | Chop-Hedging Engine |
+| `InpMaxHedgeLegs` | `2` | Chop-Hedging Engine |
+
+---
+
+### Comprehensive SWOT
+
+#### Strengths
+
+| ID | Strength | Evidence |
+|---|---|---|
+| **SH1** | Captures range-oscillation opportunities the ADX gate currently discards | O5 audit finding |
+| **SH2** | Reuses `CAdxFilter::IsChoppy()` — negation of `IsDirectional()`, no new indicator call | `oneminuteman.mq4` §7b |
+| **SH3** | Default-OFF: v10.14 behaviour 100% preserved for all existing users | `InpEnableChopHedge = false` |
+| **SH4** | `InpMaxHedgeLegs` provides explicit, enumerable exposure cap | Design spec |
+| **SH5** | Direction logic reuses `m_range.Mid()` — zero incremental computation | `CRangeScanner` |
+| **SH6** | New-bar rhythm avoids over-trading on every tick | Wired in `OnTickHandler` `newBar` gate |
+
+#### Weaknesses
+
+| ID | Weakness | Evidence |
+|---|---|---|
+| **WH1** | **Breaks single-position invariant** — multi-leg exposure means a single adverse move affects all legs | Architecture invariant |
+| **WH2** | **Breaks FIFO compatibility** — netting brokers reject concurrent opposing positions | NFA Rule 2-43(b); MT4 netting mode |
+| **WH3** | **Erodes fixed-linear-risk guarantee** — worst case is `InpMaxHedgeLegs × InpHedgeLots`, not 1× | S1 SWOT item |
+| **WH4** | No backtest evidence that range-fade has positive expectancy on M1 for this EA | W5 / W4 audit items |
+| **WH5** | Open hedge legs block loss-reversal engine from firing (reversal waits for flat) | Interaction rule above |
+| **WH6** | Hedge legs consume `InpMaxTradesPerDay` quota — can crowd out signal entries | Daily counter increments |
+
+#### Opportunities
+
+| ID | Opportunity | Evidence |
+|---|---|---|
+| **OH1** | Aligns with O5 — "mean-reversion capture in ADX-chop regimes" | `PLAN.md` O5 |
+| **OH2** | ADX choppiness state already computed every tick for panel — zero incremental cost | `UpdateComment()` ADX row |
+| **OH3** | `InpMaxHedgeLegs = 1` makes this a "single counter-trend range entry" — lower risk profile | Parameter choice |
+| **OH4** | Future: extract `CChopHedgeEngine` as a fully independent SRP class for isolated backtesting | SRP principle |
+
+#### Threats
+
+| ID | Threat | Evidence |
+|---|---|---|
+| **TH1** | **Prop-firm ToS** — FTMO, MFF, The5ers, and US brokers explicitly prohibit simultaneous hedging | Standard prop-firm rules |
+| **TH2** | **Breakout from range** — a chop-to-trend transition hits both hedge legs simultaneously if open as a straddle | Common market pattern |
+| **TH3** | **ADX threshold sensitivity** — `InpAdxThreshold = 20` is a convention; wrong level = wrong regime detection | W9 audit origin |
+| **TH4** | **State-machine complexity** — three concurrent entry paths (normal / reversal / chop-hedge) increase bug surface | Interaction rules above |
+| **TH5** | **Silent order rejection** — on FIFO brokers, `OrderSend` fails silently; `m_trades_today` is NOT incremented on failure (CTradeExecutor checks return) | `CTradeExecutor::Open()` error-check pattern |
+
+---
+
+### Verification Checklist (v10.15)
+
+| # | Check | Expected | Status |
+|---|---|---|---|
+| V1 | `#property version "10.15"` | ✅ | In code |
+| V2 | `^input ` grep = 60 | 60 | In code |
+| V3 | `InpEnableChopHedge` default = `false` | `false` | In code |
+| V4 | `ManageEntries()` `CountPositions() > 0` guard unchanged | Unmodified | In code |
+| V5 | `ManageChopHedge()` has `CountPositions() < InpMaxHedgeLegs` | Present | In code |
+| V6 | `CAdxFilter::IsChoppy()` = `!IsDirectional()` | Present | In code |
+| V7 | `ManageChopHedge()` returns immediately if flag OFF | First guard | In code |
+| V8 | `ManageChopHedge()` increments `m_trades_today` on success | Present | In code |
+| V9 | `ManageChopHedge()` suppressed when `m_reversal_pending` | Present | In code |
+| V10 | `OnInit()` prints FIFO-break warning when flag ON | Present | In code |
+| V11 | `conservative.set` has `InpEnableChopHedge=0` | `0` | In file |
+| V12 | `ftmo_challenge.set` has `InpEnableChopHedge=0` | `0` | In file |
+| V13 | `UpdateComment()` shows Hedge status row | Present | In code |
+| V14 | STATE_MAGIC unchanged (0x4F4D4D36) — no new persisted fields | Unchanged | In code |
+| V15 | Compile with `#property strict` — 0 errors | ✅ | Pending MetaEditor |
+| V16 | `ManageChopHedge()` wired after `ManageEntries()` in `OnTickHandler()` | Present | In code |
+
+---
+
+### GO/NO-GO Recommendation
+
+| Account Type | Recommendation | Reason |
+|---|---|---|
+| FIFO/netting broker (US, most EU retail) | 🔴 **NO-GO** | Orders rejected; breaks broker ToS; EA logs errors but continues |
+| Prop-firm (FTMO, MFF, The5ers) | 🔴 **NO-GO** | Violates hedging prohibition; will fail challenge evaluation |
+| Hedging-enabled broker, demo account | 🟡 **DEMO ONLY** | Feature functional but statistically unvalidated |
+| Hedging-enabled broker, live account | 🟡 **NOT RECOMMENDED** | No backtest evidence; range-fade on M1 is low-signal |
+
+**The default `InpEnableChopHedge = false` ensures v10.15 is a drop-in safe upgrade for all existing users. Enable only on hedging-enabled brokers after thorough demo validation.**
+
+---

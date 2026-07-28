@@ -5,9 +5,9 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, nhasibuan"
 #property link      "https://github.com/nhasibuan/g"
-#property version   "10.14"
+#property version   "10.15"
 #property strict
-#property description "OneMinuteMan v10.13: Signal-only M1 scalper with event-driven loss-reversal."
+#property description "OneMinuteMan v10.15: Signal-only M1 scalper with event-driven loss-reversal and opt-in chop-hedging mode."
 #property description "No martingale. Fixed linear risk. FIFO/netting compatible."
 #property description "ATR-dynamic risk, virtual SL with safety net, break-even, persistent equity guards."
 
@@ -177,6 +177,15 @@ input double InpMinWinRate           = 0.45; // Minimum acceptable win-rate (0.4
 
 //--- Reversal Safety (v10.14)
 input int    InpReversalArmTimeoutSec = 300; // 0=off; auto-disarm reversal if unfired after N seconds
+
+//--- Chop-Hedging Engine (v10.15)
+//    When ADX < InpAdxThreshold (market is choppy/sideways), opens a mean-reversion
+//    range-fade position instead of blocking entry. Opt-in; default OFF.
+//    WARNING: Breaks FIFO compatibility and single-position invariant.
+//    DO NOT enable on netting brokers or prop-firm accounts.
+input bool   InpEnableChopHedge = false; // Enable chop-hedging (FIFO-BREAKING; default OFF)
+input double InpHedgeLots       = 0.0;   // 0.0 = use InpBaseLots for hedge legs
+input int    InpMaxHedgeLegs    = 2;     // Max concurrent chop-hedge legs (hard exposure cap)
 
 //==================================================================
 // SECTION 2 -- CONSTANTS, STRUCTURES & UTILITIES
@@ -585,10 +594,11 @@ public:
 };
 
 //==================================================================
-// SECTION 7b -- CAdxFilter : ADX trend-strength regime filter (v10.14)
 //==================================================================
-// Prevents entries in choppy/sideways markets where M1 signals have
-// lower win rate. ADX < threshold → block fresh entry.
+// SECTION 7b -- CAdxFilter : ADX trend-strength regime filter (v10.14/v10.15)
+//==================================================================
+// v10.14: Prevents entries in choppy/sideways markets (ADX < threshold).
+// v10.15: Adds IsChoppy() for chop-hedging mode direction (inverse of IsDirectional).
 // Addresses W9 (no ADX filter) and T4 (choppy market losses) from audit.
 class CAdxFilter {
 private:
@@ -610,6 +620,16 @@ public:
       double adx = iADX(Symbol(), PERIOD_M1, m_period, PRICE_CLOSE, MODE_MAIN, 1);
       if(adx <= 0.0 || adx == EMPTY_VALUE) return true; // not ready: pass
       return (adx >= m_threshold);
+   }
+
+   // v10.15: Returns true when market is choppy (ADX < threshold).
+   // Used by ManageChopHedge() to trigger mean-reversion range-fade entries.
+   // When filter is disabled: always returns false (chop-hedge never fires without ADX data).
+   bool IsChoppy() {
+      if(!m_enabled) return false; // no ADX data = cannot determine chop; default safe
+      double adx = iADX(Symbol(), PERIOD_M1, m_period, PRICE_CLOSE, MODE_MAIN, 1);
+      if(adx <= 0.0 || adx == EMPTY_VALUE) return false; // indicator not ready: don't hedge
+      return (adx < m_threshold);
    }
 
    double Value() {
@@ -1520,13 +1540,55 @@ private:
       }
    }
 
+   // v10.15: Chop-Hedging Engine.
+   // Opens a mean-reversion range-fade position when ADX is below threshold.
+   // FIFO-BREAKING: allows CountPositions() < InpMaxHedgeLegs concurrent positions.
+   // ManageEntries() is NOT modified and still blocks on CountPositions() > 0.
+   // This method is the ONLY code path that may open a second concurrent position.
+   void ManageChopHedge(bool allowFresh) {
+      if(!InpEnableChopHedge || !InpEnableTrading) return;
+      if(!allowFresh)                              return; // fire on new bar only
+      if(!m_adx.IsChoppy())                        return; // only in choppy regime
+      if(m_reversal_pending)                       return; // reversal takes priority
+      if(!TradingWindowOpen())                     return;
+      if(!m_spread.SpreadOK())                     return;
+      if(!EquityGuardOK())                         return;
+
+      // Leg cap: never exceed InpMaxHedgeLegs concurrent positions
+      if(m_exec.CountPositions() >= InpMaxHedgeLegs) return;
+
+      // Daily trade limit
+      if(InpMaxTradesPerDay > 0 && m_trades_today >= InpMaxTradesPerDay) return;
+
+      // --- Range-fade direction logic ---
+      // Fade the upper range boundary (SELL) or lower boundary (BUY).
+      // m_range.High() and Low() are from the 60-second tick ring buffer.
+      double rangeMid = (m_range.High() + m_range.Low()) / 2.0;
+      int hedgeDir = (Ask > rangeMid) ? -1 : +1; // -1=SELL fade top; +1=BUY fade bottom
+
+      double lots = (InpHedgeLots > 0.0)
+                       ? NormalizeLots(InpHedgeLots)
+                       : NormalizeLots(InpBaseLots);
+
+      if(m_exec.Open(hedgeDir, lots, m_risk, m_vsl, m_spread.EffSlippage())) {
+         m_last_was_reversal = false; // hedge is not a reversal leg
+         m_trades_today++;
+         Print("ChopHedge fired: dir=", (hedgeDir > 0) ? "BUY" : "SELL",
+               " lots=", DoubleToString(lots, 2),
+               " ADX=", DoubleToString(m_adx.Value(), 1),
+               " mid=", DoubleToString(rangeMid, 5),
+               " positions=", m_exec.CountPositions());
+         SaveState();
+      }
+   }
+
    // v10.14: Rate-limited to 1 Hz to avoid StringFormat on every 50ms timer tick.
    void UpdateComment() {
       datetime now = TimeCurrent();
       if(now == m_last_comment_time) return; // skip if already updated this second
       m_last_comment_time = now;
 
-      string msg = "=== OneMinuteMan v10.14 (no-mart) ===\n";
+      string msg = "=== OneMinuteMan v10.15 (no-mart) ===\n";
       msg += StringFormat("Symbol:%-6s  Engine:%s\n", Symbol(), TFLabel());
       msg += "--- Range ---\n";
       msg += StringFormat("High:%.5f  Low:%.5f  Range:%.5f\n",
@@ -1537,11 +1599,20 @@ private:
                              CandleTypeName(m_candle.type), TrendName(m_candle.unit));
       if(InpShowPPM && m_ppm_valid)
          msg += StringFormat("PPM:%.2f  Zone:%s\n", m_ppm.ppm, PpmZoneName(m_ppm.zone));
-      if(InpUseAdxFilter)
-         msg += StringFormat("ADX:%.1f %s (thr:%.0f)\n",
+      if(InpUseAdxFilter) {
+         bool chop = m_adx.IsChoppy();
+         msg += StringFormat("ADX:%.1f %s (thr:%.0f)%s\n",
                              m_adx.Value(),
-                             m_adx.IsDirectional() ? "OK" : "CHOP",
-                             InpAdxThreshold);
+                             !chop ? "TREND" : "CHOP",
+                             InpAdxThreshold,
+                             (InpEnableChopHedge && chop) ? " [HEDGE-ARM]" : "");
+      }
+      // v10.15: Chop-hedge status row
+      if(InpEnableChopHedge)
+         msg += StringFormat("ChopHedge:ON  Legs:%d/%d  Lots:%.2f\n",
+                             m_exec.CountPositions(),
+                             InpMaxHedgeLegs,
+                             (InpHedgeLots > 0.0) ? InpHedgeLots : InpBaseLots);
       msg += "--- Trade ---\n";
       msg += StringFormat("Trading:%s  Spread:%d/%d  Equity:$%.2f  DD:%.2f%%\n",
                           InpEnableTrading ? "ON" : "OFF",
@@ -1614,6 +1685,17 @@ public:
          { Print("Error: InpMaxReverseLossesPerDay must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
       if(InpMaxTradesPerDay < 0)
          { Print("Error: InpMaxTradesPerDay must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
+      if(InpMaxHedgeLegs < 1)
+         { Print("Error: InpMaxHedgeLegs must be >= 1"); return INIT_PARAMETERS_INCORRECT; }
+      if(InpEnableChopHedge && !InpUseAdxFilter)
+         { Print("Error: InpEnableChopHedge requires InpUseAdxFilter=true (ADX data needed for choppiness detection)"); return INIT_PARAMETERS_INCORRECT; }
+      // v10.15: FIFO-compatibility warning when chop-hedge is enabled
+      if(InpEnableChopHedge) {
+         Print("WARNING: InpEnableChopHedge=true.");
+         Print("  This opens concurrent positions (FIFO-BREAKING).");
+         Print("  Violates most prop-firm rules and US FIFO regulation.");
+         Print("  Only enable on brokers explicitly permitting long+short hedging.");
+      }
 
       // --- component initialization ---
       m_spread.Init(InpSprEmaAlpha, InpMaxSpreadMult, InpSlippageMult,
@@ -1689,7 +1771,8 @@ public:
          { Print("Error: Timer failed"); return INIT_FAILED; }
 
       m_initialized = true;
-      Print("OneMinuteMan v10.14 (no-mart) initialized. ADX:", InpUseAdxFilter?"ON":"OFF",
+      Print("OneMinuteMan v10.15 initialized. ADX:", InpUseAdxFilter?"ON":"OFF",
+            " ChopHedge:", InpEnableChopHedge?"ON (FIFO-BREAKING)":"OFF",
             " WinRateHalt:", InpUseWinRateHalt?"ON":"OFF",
             " ReversalTimeout:", InpReversalArmTimeoutSec, "s");
       return INIT_SUCCEEDED;
@@ -1758,6 +1841,7 @@ public:
       m_vsl.Enforce(m_spread.EffSlippage());
       ManageReverseEntry();
       ManageEntries(newBar);
+      ManageChopHedge(newBar); // v10.15: chop-hedge fires after normal entry path
    }
 
    bool IsNewBar() {
