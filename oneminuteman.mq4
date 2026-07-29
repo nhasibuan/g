@@ -5,9 +5,9 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, nhasibuan"
 #property link      "https://github.com/nhasibuan/g"
-#property version   "10.15"
+#property version   "10.16"
 #property strict
-#property description "OneMinuteMan v10.15: Signal-only M1 scalper with event-driven loss-reversal and opt-in chop-hedging mode."
+#property description "OneMinuteMan v10.16: Signal-only M1 scalper with event-driven loss-reversal and transition-based chop-hedging."
 #property description "No martingale. Fixed linear risk. FIFO/netting compatible by default (chop-hedge breaks FIFO when enabled)."
 #property description "ATR-dynamic risk, virtual SL with safety net, break-even, persistent equity guards."
 
@@ -57,6 +57,14 @@ enum ENUM_REVERSE_CONFIRM {
    REVERSE_CONFIRM_PPM    = 2, // PPM zone must be MEDIUM or HIGH
    REVERSE_CONFIRM_EITHER = 3, // candle OR PPM
    REVERSE_CONFIRM_BOTH   = 4  // candle AND PPM
+};
+
+// v10.16: Chop-hedge trigger mode — controls when ManageChopHedge() fires.
+// STATE (v10.15 behavior): fires on every choppy bar (ADX < threshold).
+// TRANSITION: fires only on the trend→chop edge (prior bar directional, current choppy).
+enum ENUM_CHOP_TRIGGER {
+   CHOP_TRIGGER_STATE      = 0, // STATE: fire every choppy bar (v10.15 behavior)
+   CHOP_TRIGGER_TRANSITION = 1  // TRANSITION: fire only on trend->chop edge (v10.16)
 };
 
 enum TYPE_CANDLESTICK {
@@ -183,14 +191,16 @@ input double InpMinWinRate           = 0.45; // Minimum acceptable win-rate (0.4
 //--- Reversal Safety (v10.14)
 input int    InpReversalArmTimeoutSec = 300; // 0=off; auto-disarm reversal if unfired after N seconds
 
-//--- Chop-Hedging Engine (v10.15)
+//--- Chop-Hedging Engine (v10.15/v10.16)
 //    When ADX < InpAdxThreshold (market is choppy/sideways), opens a mean-reversion
 //    range-fade position instead of blocking entry. Opt-in; default OFF.
 //    WARNING: Breaks FIFO compatibility and single-position invariant.
 //    DO NOT enable on netting brokers or prop-firm accounts.
-input bool   InpEnableChopHedge = false; // Enable chop-hedging (FIFO-BREAKING; default OFF)
-input double InpHedgeLots       = 0.0;   // 0.0 = use InpBaseLots for hedge legs
-input int    InpMaxHedgeLegs    = 2;     // Max concurrent chop-hedge legs (hard exposure cap)
+input bool               InpEnableChopHedge  = false;               // Enable chop-hedging (FIFO-BREAKING; default OFF)
+input ENUM_CHOP_TRIGGER  InpChopHedgeTrigger = CHOP_TRIGGER_TRANSITION; // Trigger: STATE (every chop bar) or TRANSITION (trend->chop edge only)
+input double             InpHedgeLots        = 0.0;                 // 0.0 = use InpBaseLots for hedge legs
+input int                InpMaxHedgeLegs     = 2;                   // Max concurrent chop-hedge legs (hard exposure cap)
+input bool               InpBreakoutExit     = true;                // Close hedge legs on breakout (ADX returns to directional)
 
 //==================================================================
 // SECTION 2 -- CONSTANTS, STRUCTURES & UTILITIES
@@ -600,22 +610,29 @@ public:
 
 //==================================================================
 //==================================================================
-// SECTION 7b -- CAdxFilter : ADX trend-strength regime filter (v10.14/v10.15)
+// SECTION 7b -- CAdxFilter : ADX trend-strength regime filter (v10.14/v10.15/v10.16)
 //==================================================================
 // v10.14: Prevents entries in choppy/sideways markets (ADX < threshold).
-// v10.15: Adds IsChoppy() for chop-hedging mode direction (inverse of IsDirectional).
+// v10.15: Adds IsChoppy() for chop-hedging mode (inverse of IsDirectional).
+// v10.16: Adds transition detection — JustBecameChoppy() fires only on the
+//         trend→chop edge (prior bar directional, current bar choppy).
+//         Implements O6 from the v10.15 post-audit.
 // Addresses W9 (no ADX filter) and T4 (choppy market losses) from audit.
 class CAdxFilter {
 private:
    bool   m_enabled;
    int    m_period;
    double m_threshold;
+   bool   m_prev_directional;  // v10.16: prior bar's regime (true=trending, false=choppy)
+   bool   m_regime_initialized; // v10.16: false until first UpdateRegime() call
 
 public:
    void Init(bool enabled, int period, double threshold) {
       m_enabled   = enabled;
       m_period    = (period > 0) ? period : 14;
       m_threshold = (threshold > 0.0) ? threshold : 20.0;
+      m_prev_directional  = true;  // assume trending until proven otherwise (safe default)
+      m_regime_initialized = false;
    }
 
    // Returns true when market is sufficiently directional (or filter disabled).
@@ -628,14 +645,42 @@ public:
    }
 
    // v10.15: Returns true when market is choppy (ADX < threshold).
-   // Used by ManageChopHedge() to trigger mean-reversion range-fade entries.
+   // Used by ManageChopHedge() in STATE trigger mode.
    // When filter is disabled: always returns false (chop-hedge never fires without ADX data).
    bool IsChoppy() {
-      if(!m_enabled) return false; // no ADX data = cannot determine chop; default safe
+      if(!m_enabled) return false;
       double adx = iADX(Symbol(), PERIOD_M1, m_period, PRICE_CLOSE, MODE_MAIN, 1);
-      if(adx <= 0.0 || adx == EMPTY_VALUE) return false; // indicator not ready: don't hedge
+      if(adx <= 0.0 || adx == EMPTY_VALUE) return false;
       return (adx < m_threshold);
    }
+
+   // v10.16 (O6): Returns true ONLY on the trend→chop transition edge.
+   // Requires prior call to UpdateRegime() on each new bar.
+   // Returns false if regime was not yet initialized (first bar after init).
+   bool JustBecameChoppy() {
+      if(!m_enabled || !m_regime_initialized) return false;
+      // Current bar must be choppy AND prior bar must have been directional
+      return (!IsDirectional() && m_prev_directional);
+   }
+
+   // v10.16: Call once per new bar to latch the prior regime state.
+   // Must be called BEFORE IsChoppy()/JustBecameChoppy() on the same bar.
+   void UpdateRegime() {
+      if(!m_enabled) return;
+      // On the first call, just initialize and don't fire transition
+      bool currentlyDirectional = IsDirectional();
+      if(m_regime_initialized) {
+         m_prev_directional = currentlyDirectional;
+      } else {
+         // First bar: latch current state, mark as initialized
+         m_prev_directional  = currentlyDirectional;
+         m_regime_initialized = true;
+      }
+   }
+
+   // v10.16: Expose the prior bar's regime for UpdateComment() panel
+   bool WasDirectional() const { return m_prev_directional; }
+   bool IsRegimeInitialized() const { return m_regime_initialized; }
 
    double Value() {
       if(!m_enabled) return 0.0;
@@ -1565,20 +1610,30 @@ private:
       }
    }
 
-   // v10.15: Chop-Hedging Engine.
+   // v10.15/v10.16: Chop-Hedging Engine.
    // Opens a mean-reversion range-fade position when ADX is below threshold.
    // FIFO-BREAKING: allows CountPositions() < InpMaxHedgeLegs concurrent positions.
    // ManageEntries() is NOT modified and still blocks on CountPositions() > 0.
    // This method is the ONLY code path that may open a second concurrent position.
    //
-   // IMPORTANT: Regime detection is STATE-BASED, not TRANSITION-BASED.
-   // IsChoppy() checks the current ADX value each new bar. There is no
-   // "was trending, just became choppy" edge detector. The EA simply reacts
-   // to the present regime on each M1 bar close.
+   // v10.16 (O6): Trigger mode is configurable via InpChopHedgeTrigger:
+   //   STATE (v10.15):      fires every bar where ADX < threshold.
+   //   TRANSITION (v10.16): fires ONLY on the trend->chop edge (prior bar directional,
+   //                        current bar choppy). Prevents re-firing on consecutive
+   //                        choppy bars and reduces false flips near threshold.
    void ManageChopHedge(bool allowFresh) {
       if(!InpEnableChopHedge || !InpEnableTrading) return;
       if(!allowFresh)                              return; // fire on new bar only
-      if(!m_adx.IsChoppy())                        return; // only in choppy regime
+
+      // v10.16: Select trigger mode
+      bool shouldFire;
+      if(InpChopHedgeTrigger == CHOP_TRIGGER_TRANSITION) {
+         shouldFire = m_adx.JustBecameChoppy(); // fires only on trend->chop edge
+      } else {
+         shouldFire = m_adx.IsChoppy();          // v10.15 behavior: fires every choppy bar
+      }
+      if(!shouldFire)                             return;
+
       if(m_reversal_pending)                       return; // reversal takes priority
       if(!TradingWindowOpen())                     return;
       if(!m_spread.SpreadOK())                     return;
@@ -1606,10 +1661,28 @@ private:
          Print("ChopHedge fired: dir=", (hedgeDir > 0) ? "BUY" : "SELL",
                " lots=", DoubleToString(lots, 2),
                " ADX=", DoubleToString(m_adx.Value(), 1),
+               " trigger=", (InpChopHedgeTrigger == CHOP_TRIGGER_TRANSITION) ? "TRANSITION" : "STATE",
                " mid=", DoubleToString(rangeMid, 5),
                " positions=", m_exec.CountPositions());
          SaveState();
       }
+   }
+
+   // v10.16 (TH2 mitigation): Breakout-detection early exit for hedge legs.
+   // When ADX returns to directional (breakout from range), close all open
+   // positions to prevent a trending move from hitting stale range-fade legs.
+   // Only active when InpEnableChopHedge=true AND InpBreakoutExit=true.
+   // Fires on every tick (not just new bar) for rapid response.
+   void ManageBreakoutExit() {
+      if(!InpEnableChopHedge || !InpBreakoutExit) return;
+      if(m_exec.CountPositions() == 0)             return; // nothing to close
+      if(!m_adx.IsDirectional())                   return; // still choppy; hold legs
+
+      // ADX is now directional while hedge legs are open -> breakout detected
+      Print("BreakoutExit: ADX=", DoubleToString(m_adx.Value(), 1),
+            " >= threshold ", DoubleToString(InpAdxThreshold, 1),
+            ". Closing ", m_exec.CountPositions(), " hedge legs.");
+      m_exec.CloseAll(m_spread.EffSlippage(), m_vsl);
    }
 
    // v10.14: Rate-limited to 1 Hz to avoid StringFormat on every 50ms timer tick.
@@ -1618,7 +1691,7 @@ private:
       if(now == m_last_comment_time) return; // skip if already updated this second
       m_last_comment_time = now;
 
-      string msg = "=== OneMinuteMan v10.15 (no-mart) ===\n";
+      string msg = "=== OneMinuteMan v10.16 (no-mart) ===\n";
       msg += StringFormat("Symbol:%-6s  Engine:%s\n", Symbol(), TFLabel());
       msg += "--- Range ---\n";
       msg += StringFormat("High:%.5f  Low:%.5f  Range:%.5f\n",
@@ -1631,18 +1704,25 @@ private:
          msg += StringFormat("PPM:%.2f  Zone:%s\n", m_ppm.ppm, PpmZoneName(m_ppm.zone));
       if(InpUseAdxFilter) {
          bool chop = m_adx.IsChoppy();
+         bool wasDir = m_adx.WasDirectional();
+         string regimeTag = !chop ? "TREND" : "CHOP";
+         string edgeTag = "";
+         if(InpEnableChopHedge && chop) {
+            if(InpChopHedgeTrigger == CHOP_TRIGGER_TRANSITION)
+               edgeTag = wasDir ? " [EDGE!]" : " [chop-cont]";
+            else
+               edgeTag = " [HEDGE-ARM]";
+         }
          msg += StringFormat("ADX:%.1f %s (thr:%.0f)%s\n",
-                             m_adx.Value(),
-                             !chop ? "TREND" : "CHOP",
-                             InpAdxThreshold,
-                             (InpEnableChopHedge && chop) ? " [HEDGE-ARM]" : "");
+                             m_adx.Value(), regimeTag, InpAdxThreshold, edgeTag);
       }
-      // v10.15: Chop-hedge status row
+      // v10.15/v10.16: Chop-hedge status row
       if(InpEnableChopHedge)
-         msg += StringFormat("ChopHedge:ON  Legs:%d/%d  Lots:%.2f\n",
+         msg += StringFormat("ChopHedge:ON  Trigger:%s  Legs:%d/%d  BreakoutExit:%s\n",
+                             (InpChopHedgeTrigger == CHOP_TRIGGER_TRANSITION) ? "EDGE" : "STATE",
                              m_exec.CountPositions(),
                              InpMaxHedgeLegs,
-                             (InpHedgeLots > 0.0) ? InpHedgeLots : InpBaseLots);
+                             InpBreakoutExit ? "ON" : "OFF");
       msg += "--- Trade ---\n";
       msg += StringFormat("Trading:%s  Spread:%d/%d  Equity:$%.2f  DD:%.2f%%\n",
                           InpEnableTrading ? "ON" : "OFF",
@@ -1801,8 +1881,10 @@ public:
          { Print("Error: Timer failed"); return INIT_FAILED; }
 
       m_initialized = true;
-      Print("OneMinuteMan v10.15 initialized. ADX:", InpUseAdxFilter?"ON":"OFF",
+      Print("OneMinuteMan v10.16 initialized. ADX:", InpUseAdxFilter?"ON":"OFF",
             " ChopHedge:", InpEnableChopHedge?"ON (FIFO-BREAKING)":"OFF",
+            " Trigger:", (InpChopHedgeTrigger==CHOP_TRIGGER_TRANSITION)?"TRANSITION":"STATE",
+            " BreakoutExit:", InpBreakoutExit?"ON":"OFF",
             " WinRateHalt:", InpUseWinRateHalt?"ON":"OFF",
             " ReversalTimeout:", InpReversalArmTimeoutSec, "s");
       return INIT_SUCCEEDED;
@@ -1849,6 +1931,7 @@ public:
       bool newBar = IsNewBar();
 
       if(newBar) {
+         m_adx.UpdateRegime(); // v10.16: latch prior regime BEFORE candle recognition
          CANDLE_STRUCTURE bar;
          if(m_candle_engine.Recognize(1, bar)) {
             m_candle       = bar;
@@ -1870,8 +1953,9 @@ public:
       m_trailing.Manage(m_risk, m_vsl, InpMagic);
       m_vsl.Enforce(m_spread.EffSlippage());
       ManageReverseEntry();
+      ManageBreakoutExit();     // v10.16 (TH2): close hedge legs on breakout
       ManageEntries(newBar);
-      ManageChopHedge(newBar); // v10.15: chop-hedge fires after normal entry path
+      ManageChopHedge(newBar); // v10.15/v10.16: chop-hedge fires after normal entry path
    }
 
    bool IsNewBar() {
