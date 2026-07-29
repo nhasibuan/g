@@ -686,6 +686,10 @@ public:
    bool IsRegimeInitialized() const { return m_regime_initialized; }
 
    double Value() {
+      return ValueAt(1);
+   }
+
+   double ValueAt(int barShift) {
       if(!m_enabled) return 0.0;
       double adx = iADX(Symbol(), PERIOD_M1, m_period, PRICE_CLOSE, MODE_MAIN, shift);
       return (adx == EMPTY_VALUE) ? 0.0 : adx;
