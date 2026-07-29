@@ -626,16 +626,27 @@ private:
    bool   m_enabled;
    int    m_period;
    double m_threshold;
+   double m_hysteresis;         // v10.16: hysteresis band width (default 0.0 = disabled)
    bool   m_prev_directional;  // v10.16: prior bar's regime (true=trending, false=choppy)
    bool   m_regime_initialized; // v10.16: false until first UpdateRegime() call
 
 public:
+   // Init signature unchanged from v10.14 (3 params) to avoid breaking callers.
+   // Use SetHysteresis() separately if hysteresis is needed.
    void Init(bool enabled, int period, double threshold) {
       m_enabled   = enabled;
       m_period    = (period > 0) ? period : 14;
       m_threshold = (threshold > 0.0) ? threshold : 20.0;
+      m_hysteresis = 0.0;       // default: no hysteresis band
       m_prev_directional  = true;  // assume trending until proven otherwise (safe default)
       m_regime_initialized = false;
+   }
+
+   // v10.16: Set hysteresis band width. Call after Init().
+   // When > 0, creates a dead zone: enter chop at (threshold - hysteresis),
+   // exit chop at (threshold + hysteresis). Reduces false flips near boundary.
+   void SetHysteresis(double hyst) {
+      m_hysteresis = (hyst >= 0.0) ? hyst : 0.0;
    }
 
    // Returns true when market is sufficiently directional (or filter disabled).
@@ -685,18 +696,23 @@ public:
    bool WasDirectional() const { return m_prev_directional; }
    bool IsRegimeInitialized() const { return m_regime_initialized; }
 
+   // Returns ADX value for the most recent closed bar (shift=1). No arguments.
+   // Used by UpdateComment(), ChopHedge print, BreakoutExit print.
    double Value() {
       return ValueAt(1);
    }
 
+   // v10.16: Returns the ADX value at a specific bar shift.
+   // Used internally by ChopTransitionTriggered() and for diagnostics.
    double ValueAt(int barShift) {
       if(!m_enabled) return 0.0;
-      double adx = iADX(Symbol(), PERIOD_M1, m_period, PRICE_CLOSE, MODE_MAIN, shift);
+      double adx = iADX(Symbol(), PERIOD_M1, m_period, PRICE_CLOSE, MODE_MAIN, barShift);
       return (adx == EMPTY_VALUE) ? 0.0 : adx;
    }
 
    // v10.16 bug fix: true only when ADX moves from trend back into chop.
    // Uses closed bars only: shifts 2..N+1 must be trend, shift 1 must be chop.
+   // Uses hysteresis band when m_hysteresis > 0.
    bool ChopTransitionTriggered(int rearmBars=1) {
       if(!m_enabled) return false;
       int bars = (rearmBars > 1) ? rearmBars : 1;
@@ -704,11 +720,11 @@ public:
       double trendEnter = m_threshold + m_hysteresis;
       if(chopEnter < 0.0) chopEnter = 0.0;
 
-      double adxNow = Value(1);
+      double adxNow = ValueAt(1);
       if(adxNow <= 0.0 || adxNow >= chopEnter) return false;
 
-      for(int shift=2; shift<2+bars; shift++) {
-         double adxPrev = Value(shift);
+      for(int barShift=2; barShift<2+bars; barShift++) {
+         double adxPrev = ValueAt(barShift);
          if(adxPrev <= 0.0 || adxPrev < trendEnter) return false;
       }
       return true;
@@ -1846,7 +1862,8 @@ public:
       m_ppm_engine.Init(InpZzDepth, InpZzDeviation, InpZzBackstep, InpZzLookback,
                         InpPpmMinHigh, InpPpmTarget, InpAtrDailyRef);
       m_volume.Init(InpUseVolumeFilter, InpVolLookback, InpVolMultiplier);
-      m_adx.Init(InpUseAdxFilter, InpAdxPeriod, InpAdxThreshold, InpAdxHysteresis);  // v10.14/v10.16
+      m_adx.Init(InpUseAdxFilter, InpAdxPeriod, InpAdxThreshold);  // v10.14 (3-param signature preserved)
+      m_adx.SetHysteresis(InpAdxHysteresis);                        // v10.16: hysteresis band
       m_clock.Init(InpTzOffsetHours, InpSessionStartHour, InpSessionEndHour);
       m_guard.Init(InpMinEquity, InpMaxDrawdownPct);
       m_risk.Init(InpAtrPeriod, InpAtrSLMult, InpAtrTPMult,
