@@ -17,8 +17,9 @@
 //  v10.13-no-mart: Martingale removed. Signal-only entry with
 //  optional event-driven loss-reversal (reverse after losing close).
 //  FIFO/netting compatible by default -- no concurrent hedging.
-//  v10.15: Opt-in chop-hedging mode (InpEnableChopHedge=false by
-//  default) opens concurrent mean-reversion positions when ADX < threshold.
+//  v10.16: Opt-in chop-hedging mode (InpEnableChopHedge=false by
+//  default) opens concurrent mean-reversion positions only on ADX
+//  trend->chop transitions.
 //  When enabled, this BREAKS FIFO/netting compatibility.
 //  -----------------------------------------------------------------
 //  Design patterns applied:
@@ -180,6 +181,8 @@ input int    InpSessionEndHour   = 24;
 input bool   InpUseAdxFilter  = true;  // Enable ADX trend-strength filter
 input int    InpAdxPeriod     = 14;    // ADX period
 input double InpAdxThreshold  = 20.0; // Min ADX value to allow fresh entry
+input int    InpChopRearmBars = 1;    // Trend bars required before trend->chop hedge trigger
+input double InpAdxHysteresis = 0.0;  // ADX deadband for chop transition (0=exact threshold)
 
 //--- Performance Tracker \u0026 Win-Rate Halt (v10.14)
 //    Tracks rolling win-rate; halts trading if win-rate falls below threshold.
@@ -684,8 +687,27 @@ public:
 
    double Value() {
       if(!m_enabled) return 0.0;
-      double adx = iADX(Symbol(), PERIOD_M1, m_period, PRICE_CLOSE, MODE_MAIN, 1);
+      double adx = iADX(Symbol(), PERIOD_M1, m_period, PRICE_CLOSE, MODE_MAIN, shift);
       return (adx == EMPTY_VALUE) ? 0.0 : adx;
+   }
+
+   // v10.16 bug fix: true only when ADX moves from trend back into chop.
+   // Uses closed bars only: shifts 2..N+1 must be trend, shift 1 must be chop.
+   bool ChopTransitionTriggered(int rearmBars=1) {
+      if(!m_enabled) return false;
+      int bars = (rearmBars > 1) ? rearmBars : 1;
+      double chopEnter = m_threshold - m_hysteresis;
+      double trendEnter = m_threshold + m_hysteresis;
+      if(chopEnter < 0.0) chopEnter = 0.0;
+
+      double adxNow = Value(1);
+      if(adxNow <= 0.0 || adxNow >= chopEnter) return false;
+
+      for(int shift=2; shift<2+bars; shift++) {
+         double adxPrev = Value(shift);
+         if(adxPrev <= 0.0 || adxPrev < trendEnter) return false;
+      }
+      return true;
    }
 };
 
@@ -1797,6 +1819,10 @@ public:
          { Print("Error: InpMaxTradesPerDay must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
       if(InpMaxHedgeLegs < 1)
          { Print("Error: InpMaxHedgeLegs must be >= 1"); return INIT_PARAMETERS_INCORRECT; }
+      if(InpChopRearmBars < 1)
+         { Print("Error: InpChopRearmBars must be >= 1"); return INIT_PARAMETERS_INCORRECT; }
+      if(InpAdxHysteresis < 0.0)
+         { Print("Error: InpAdxHysteresis must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
       if(InpEnableChopHedge && !InpUseAdxFilter)
          { Print("Error: InpEnableChopHedge requires InpUseAdxFilter=true (ADX data needed for choppiness detection)"); return INIT_PARAMETERS_INCORRECT; }
       // v10.15: FIFO-compatibility warning when chop-hedge is enabled
@@ -1816,7 +1842,7 @@ public:
       m_ppm_engine.Init(InpZzDepth, InpZzDeviation, InpZzBackstep, InpZzLookback,
                         InpPpmMinHigh, InpPpmTarget, InpAtrDailyRef);
       m_volume.Init(InpUseVolumeFilter, InpVolLookback, InpVolMultiplier);
-      m_adx.Init(InpUseAdxFilter, InpAdxPeriod, InpAdxThreshold);  // v10.14
+      m_adx.Init(InpUseAdxFilter, InpAdxPeriod, InpAdxThreshold, InpAdxHysteresis);  // v10.14/v10.16
       m_clock.Init(InpTzOffsetHours, InpSessionStartHour, InpSessionEndHour);
       m_guard.Init(InpMinEquity, InpMaxDrawdownPct);
       m_risk.Init(InpAtrPeriod, InpAtrSLMult, InpAtrTPMult,

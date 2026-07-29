@@ -80,7 +80,7 @@ The EA is structured as a **single-file component architecture** using classic O
 9. PPM zone is MEDIUM or HIGH (ZigZag momentum confirmed)
 10. Tick volume ≥ multiplier × average (liquidity spike confirmed)
 11. Candle produces a directional signal (pattern + trend aligned)
-12. ADX ≥ threshold (trend-strength regime gate — v10.14; inverted to chop-hedge when `InpEnableChopHedge=true`)
+12. ADX ≥ threshold for fresh trend entries; chop-hedge uses the opposite closed-bar transition (`ADX[2] >= threshold` → `ADX[1] < threshold`) when `InpEnableChopHedge=true`
 
 > [!WARNING]
 > **`InpEnableChopHedge = true` (v10.15+):** Allows multiple concurrent positions (up to `InpMaxHedgeLegs`). This **breaks the single-position invariant and FIFO compatibility**. v10.16 default trigger is **TRANSITION** (fires once per regime switch). `InpBreakoutExit = true` (default) closes hedge legs on breakout. **Do not enable on FTMO/prop-firm accounts or US/EU netting brokers.**
