@@ -8,7 +8,7 @@
 #property version   "10.15"
 #property strict
 #property description "OneMinuteMan v10.15: Signal-only M1 scalper with event-driven loss-reversal and opt-in chop-hedging mode."
-#property description "No martingale. Fixed linear risk. FIFO/netting compatible."
+#property description "No martingale. Fixed linear risk. FIFO/netting compatible by default (chop-hedge breaks FIFO when enabled)."
 #property description "ATR-dynamic risk, virtual SL with safety net, break-even, persistent equity guards."
 
 //==================================================================
@@ -16,7 +16,10 @@
 //  -----------------------------------------------------------------
 //  v10.13-no-mart: Martingale removed. Signal-only entry with
 //  optional event-driven loss-reversal (reverse after losing close).
-//  FIFO/netting compatible -- no concurrent hedging.
+//  FIFO/netting compatible by default -- no concurrent hedging.
+//  v10.15: Opt-in chop-hedging mode (InpEnableChopHedge=false by
+//  default) opens concurrent mean-reversion positions when ADX < threshold.
+//  When enabled, this BREAKS FIFO/netting compatibility.
 //  -----------------------------------------------------------------
 //  Design patterns applied:
 //   - Facade            : CExpertAdvisor is the single entry point that
@@ -27,16 +30,18 @@
 //       CCandleEngine         candlestick classification + signal
 //       CPpmEngine            ZigZag pips-per-minute efficiency
 //       CVolumeFilter         tick-volume spike gate
+//       CAdxFilter            ADX regime filter (v10.14/v10.15)
 //       CSessionClock         timezone / session / day-stamp logic
 //       CEquityGuard          drawdown & equity-floor protection
 //       CRiskModel            ATR-dynamic SL/TP/trailing resolution
+//       CPerformanceTracker   rolling win-rate + CSV log (v10.14)
 //       CVirtualStopManager   hidden SL registry + enforcement
 //       CTrailingManager      break-even + trailing stop logic
 //       CTradeExecutor        order send / flatten / history scan
 //       CStateStore           versioned binary persistence (Memento)
 //   - Guard clauses everywhere; no hidden global mutation: all state
 //     lives inside the owning component.
-//   - Entry gate: 11 serial guard clauses (conjunctive AND).
+//   - Entry gate: 12 serial guard clauses (conjunctive AND, v10.14+).
 //   - Conflict resolution (CR6): Timer SL enforcement always runs
 //     before any entry logic.
 //==================================================================
@@ -191,7 +196,7 @@ input int    InpMaxHedgeLegs    = 2;     // Max concurrent chop-hedge legs (hard
 // SECTION 2 -- CONSTANTS, STRUCTURES & UTILITIES
 //==================================================================
 #define MAX_POSITIONS 20
-#define STATE_MAGIC   0x4F4D4D36 // "OMM6" -- v10.14 state format (adds CPerformanceTracker ring buffer)
+#define STATE_MAGIC   0x4F4D4D36 // "OMM6" -- v10.14+ state format (CPerformanceTracker ring buffer; v10.15 chop-hedge adds no new fields)
 
 const double LONG_BODY_FACTOR   = 1.3;
 const double SHORT_BODY_FACTOR  = 0.5;
@@ -1304,7 +1309,8 @@ public:
 // SECTION 15 -- CExpertAdvisor : Facade wiring all components
 //==================================================================
 // v10.13: Martingale controller removed. Signal-only entry with
-// event-driven loss-reversal. FIFO/netting compatible.
+// event-driven loss-reversal. FIFO/netting compatible by default.
+// v10.15: Opt-in chop-hedging mode (ManageChopHedge); breaks FIFO when enabled.
 class CExpertAdvisor {
 private:
    CSpreadMonitor        m_spread;
@@ -1326,7 +1332,7 @@ private:
    bool             m_candle_valid;
    PPM_RESULT       m_ppm;
    bool             m_ppm_valid;
-   bool             m_had_pos;
+   int              m_prev_pos_count;   // v10.15 audit: int instead of bool, tracks partial hedge leg closures
    bool             m_halted;
    datetime         m_halt_until;
    bool             m_initialized;
@@ -1381,58 +1387,77 @@ private:
    }
 
    // v10.13: Detect position closure and arm loss-reversal if applicable.
+   // v10.15 audit fix (F6): Uses m_prev_pos_count (int) instead of m_had_pos (bool)
+   // to detect PARTIAL leg closures in chop-hedge mode. When a hedge leg closes while
+   // other legs remain open (n < m_prev_pos_count && n > 0), we still record the close
+   // in CPerformanceTracker for accurate win-rate, but do NOT arm loss-reversal (that
+   // correctly waits for CountPositions() == 0).
    void UpdateTradeState() {
       int n = m_exec.CountPositions();
-      if(n == 0 && m_had_pos) {
+
+      // Detect any reduction in position count (full close or partial hedge leg close)
+      if(n < m_prev_pos_count) {
          // Record the close in the performance tracker (v10.14)
+         // This fires for EVERY closed leg, not just when account goes flat.
          double closePx = 0.0;
          double profit  = m_exec.LastClosedProfit(closePx);
          int    lastDir = m_exec.LastClosedDir();
          double lastLots = NormalizeLots(InpBaseLots); // approximate; CTradeExecutor tracks exact
          m_perf.RecordClose(profit, lastDir, lastLots);
 
-         // Win-rate auto-halt check (v10.14)
-         if(InpUseWinRateHalt && m_perf.ShouldHalt(InpMinWinRate)) {
-            HaltForToday(StringFormat("win-rate %.0f%% < %.0f%% over %d trades",
-               m_perf.WinRate() * 100.0, InpMinWinRate * 100.0, m_perf.WindowSize()));
-         }
+         if(n == 0) {
+            // === FULL CLOSE: account is flat — evaluate reversal ===
 
-         if(profit < 0.0) {
-            // Track reverse-leg losses separately
-            if(m_last_was_reversal) {
-               m_reversal_losses_today++;
+            // Win-rate auto-halt check (v10.14)
+            if(InpUseWinRateHalt && m_perf.ShouldHalt(InpMinWinRate)) {
+               HaltForToday(StringFormat("win-rate %.0f%% < %.0f%% over %d trades",
+                  m_perf.WinRate() * 100.0, InpMinWinRate * 100.0, m_perf.WindowSize()));
             }
-            // Arm the loss-reversal if enabled and within daily limits
-            if(InpEnableLossReversal && lastDir != 0) {
-               bool withinLimits = true;
-               if(InpMaxReverseLossesPerDay > 0 && m_reversal_losses_today >= InpMaxReverseLossesPerDay)
-                  withinLimits = false;
-               if(InpMaxTradesPerDay > 0 && m_trades_today >= InpMaxTradesPerDay)
-                  withinLimits = false;
 
-               if(withinLimits) {
-                  m_reversal_pending     = true;
-                  m_reversal_dir         = -lastDir; // opposite direction
-                  m_last_loss_close_time = TimeCurrent();
-                  Print("Loss-reversal armed: dir=", (m_reversal_dir > 0) ? "BUY" : "SELL",
-                        " after loss $", DoubleToString(profit, 2),
-                        " revLosses=", m_reversal_losses_today,
-                        "/", InpMaxReverseLossesPerDay);
-               } else {
-                  m_reversal_pending = false;
-                  Print("Loss-reversal skipped: daily limit reached (",
-                        "revLosses=", m_reversal_losses_today,
-                        " trades=", m_trades_today, ")");
+            if(profit < 0.0) {
+               // Track reverse-leg losses separately
+               if(m_last_was_reversal) {
+                  m_reversal_losses_today++;
                }
+               // Arm the loss-reversal if enabled and within daily limits
+               if(InpEnableLossReversal && lastDir != 0) {
+                  bool withinLimits = true;
+                  if(InpMaxReverseLossesPerDay > 0 && m_reversal_losses_today >= InpMaxReverseLossesPerDay)
+                     withinLimits = false;
+                  if(InpMaxTradesPerDay > 0 && m_trades_today >= InpMaxTradesPerDay)
+                     withinLimits = false;
+
+                  if(withinLimits) {
+                     m_reversal_pending     = true;
+                     m_reversal_dir         = -lastDir; // opposite direction
+                     m_last_loss_close_time = TimeCurrent();
+                     Print("Loss-reversal armed: dir=", (m_reversal_dir > 0) ? "BUY" : "SELL",
+                           " after loss $", DoubleToString(profit, 2),
+                           " revLosses=", m_reversal_losses_today,
+                           "/", InpMaxReverseLossesPerDay);
+                  } else {
+                     m_reversal_pending = false;
+                     Print("Loss-reversal skipped: daily limit reached (",
+                           "revLosses=", m_reversal_losses_today,
+                           " trades=", m_trades_today, ")");
+                  }
+               }
+            } else {
+               // Winning close -- reset reversal state
+               m_reversal_pending = false;
             }
+            m_last_was_reversal = false;
+            SaveState();
          } else {
-            // Winning close -- reset reversal state
-            m_reversal_pending = false;
+            // === PARTIAL CLOSE: other hedge legs still open ===
+            // Profit was already recorded above. Do NOT arm reversal (wait for flat).
+            // Do NOT check win-rate halt (positions still open).
+            Print("Partial close (hedge leg): profit=$", DoubleToString(profit, 2),
+                  " remaining legs=", n);
+            SaveState();
          }
-         m_last_was_reversal = false;
-         SaveState();
       }
-      m_had_pos = (n > 0);
+      m_prev_pos_count = n;
    }
 
    // v10.13: Event-driven loss-reversal entry.
@@ -1545,6 +1570,11 @@ private:
    // FIFO-BREAKING: allows CountPositions() < InpMaxHedgeLegs concurrent positions.
    // ManageEntries() is NOT modified and still blocks on CountPositions() > 0.
    // This method is the ONLY code path that may open a second concurrent position.
+   //
+   // IMPORTANT: Regime detection is STATE-BASED, not TRANSITION-BASED.
+   // IsChoppy() checks the current ADX value each new bar. There is no
+   // "was trending, just became choppy" edge detector. The EA simply reacts
+   // to the present regime on each M1 bar close.
    void ManageChopHedge(bool allowFresh) {
       if(!InpEnableChopHedge || !InpEnableTrading) return;
       if(!allowFresh)                              return; // fire on new bar only
@@ -1658,7 +1688,7 @@ public:
       m_initialized  = false;
       m_candle_valid = false;
       m_ppm_valid    = false;
-      m_had_pos      = false;
+      m_prev_pos_count = 0;
       m_halted       = false;
       m_halt_until   = 0;
       m_last_bar_time     = 0;
@@ -1765,7 +1795,7 @@ public:
          m_guard.ResetBaseline(m_clock.LocalDayStamp());
       }
 
-      m_had_pos = (m_exec.CountPositions() > 0);
+      m_prev_pos_count = m_exec.CountPositions();
 
       if(!EventSetMillisecondTimer(InpSampleMs))
          { Print("Error: Timer failed"); return INIT_FAILED; }

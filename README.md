@@ -347,7 +347,9 @@ Two preset files are shipped with the EA. Load them via MT4 Strategy Tester → 
 
 ## Overall Assessment
 
-**OneMinuteMan v10.15** is a technically sophisticated, well-documented MT4 scalping EA with fixed linear risk, comprehensive persistent risk controls, and a clean signal-only architecture. v10.15 adds an opt-in chop-hedging mode (mean-reversion range-fade when ADX is in chop regime) behind a default-OFF flag. **The chop-hedge feature explicitly breaks FIFO compatibility and is not recommended for prop-firm accounts.** Default behaviour is identical to v10.14 for all existing users.
+**OneMinuteMan v10.15** (post-audit) is a technically sophisticated, well-documented MT4 scalping EA with fixed linear risk, comprehensive persistent risk controls, and a clean signal-only architecture. v10.15 adds an opt-in chop-hedging mode (mean-reversion range-fade when ADX is in chop regime) behind a default-OFF flag. **The chop-hedge feature explicitly breaks FIFO compatibility and is not recommended for prop-firm accounts.** Default behaviour is identical to v10.14 for all existing users.
+
+A post-implementation audit (2026-07-29) found and resolved 7 issues: 4 stale header/comment claims (gate count, FIFO qualification, component list), 1 minor comment update, **1 bug** (partial hedge-leg closures not tracked in CPerformanceTracker — fixed via `m_prev_pos_count` replacing `m_had_pos`), and 1 documentation gap (state-based vs transition-based regime detection now documented). See PLAN.md for full details.
 
 ### Summary
 
@@ -367,6 +369,8 @@ Two preset files are shipped with the EA. Load them via MT4 Strategy Tester → 
 3. **No Official Backtest Statistics**: Trust in the EA's edge must rest on your own testing and code/design quality
 4. **Reverse Leg Risk**: Both-leg losses (original + reverse) double per-cycle drawdown; `InpMaxReverseLossesPerDay` mitigates but does not eliminate this risk
 5. **Breaking Change from v10.12**: All martingale inputs removed; `.set` files must be recreated; state files are incompatible (OMM4 → OMM5)
+6. **Chop-Hedge Risk (v10.15)**: When `InpEnableChopHedge=true`, multiple concurrent positions are opened. This breaks FIFO/netting compatibility and the fixed-linear-risk guarantee. Maximum exposure = `InpMaxHedgeLegs × InpHedgeLots`. Do not enable on prop-firm or netting broker accounts.
+7. **Regime Detection is State-Based**: The chop-hedge fires based on the current ADX value each bar, not on a trend→chop transition. ADX oscillation near the threshold will cause frequent regime flips.
 
 ### Recommendation
 
@@ -386,11 +390,11 @@ Two preset files are shipped with the EA. Load them via MT4 Strategy Tester → 
 
 - **Repository**: [nhasibuan/g](https://github.com/nhasibuan/g)
 - **Author**: [Norman Hasibuan (@nhasibuan)](https://github.com/nhasibuan)
-- **Latest Version**: v10.15 (July 28, 2026) — chop-hedging mode (opt-in, FIFO-breaking), default OFF
+- **Latest Version**: v10.15 (July 28, 2026; post-audit July 29) — chop-hedging mode (opt-in, FIFO-breaking), 7 audit findings resolved
 - **License**: [MIT](LICENSE)
 - **Contributing**: [CONTRIBUTING.md](CONTRIBUTING.md)
 - **For Issues/Questions**: Refer to repository documentation and risk warnings
 
 ---
 
-*OneMinuteMan v10.15 is a disciplined, signal-only M1 scalper. Fixed risk per trade. No martingale. No compounding. 60 configurable inputs. 15 SRP classes. 12 serial entry guards. Opt-in chop-hedge (FIFO-breaking, default OFF). Demo thoroughly and trade responsibly.*
+*OneMinuteMan v10.15 (post-audit) is a disciplined, signal-only M1 scalper. Fixed risk per trade. No martingale. No compounding. 60 configurable inputs. 15 SRP classes. 12 serial entry guards. Opt-in chop-hedge (FIFO-breaking, default OFF). Post-audit: 7 findings resolved including partial-close tracking bug. Demo thoroughly and trade responsibly.*

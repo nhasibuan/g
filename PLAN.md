@@ -780,3 +780,69 @@ This is statistically consistent with mean-reversion: in a ranging market, price
 **The default `InpEnableChopHedge = false` ensures v10.15 is a drop-in safe upgrade for all existing users. Enable only on hedging-enabled brokers after thorough demo validation.**
 
 ---
+
+## v10.15 Post-Implementation Audit (2026-07-29)
+
+**Audit Date:** 2026-07-29  
+**Method:** Line-by-line source review of `oneminuteman.mq4` (1,863 LOC pre-fix) against all claims in README, PLAN.md, and commit messages.  
+**Result:** 7 findings (F1–F7); all resolved in-place.
+
+### Findings
+
+| ID | Severity | Area | Finding | Fix Applied |
+|---|---|---|---|---|
+| **F1** | 🟡 Stale | Header | Gate count "11" → should be 12 (since v10.14) | Updated to "12 serial guard clauses (v10.14+)" |
+| **F2** | 🟡 Stale | Header | "no concurrent hedging" contradicted by v10.15 | Qualified "by default"; added chop-hedge note |
+| **F3** | 🟡 Stale | `#property` | "FIFO/netting compatible" unconditional | "by default (chop-hedge breaks FIFO when enabled)" |
+| **F4** | 🟡 Stale | Header | Component list omits CAdxFilter, CPerformanceTracker | Added both |
+| **F5** | ⚪ Minor | Comment | STATE_MAGIC comment says "v10.14 state format" | "v10.14+" |
+| **F6** | 🔴 **BUG** | Logic | `UpdateTradeState()` used `m_had_pos` (bool) — partial multi-leg closures invisible to CPerformanceTracker | `m_prev_pos_count` (int); fires on `n < m_prev_pos_count` |
+| **F7** | ⚪ Doc | Comment | Regime detection is state-based not transition-based; undocumented | Added "STATE-BASED, not TRANSITION-BASED" comment |
+
+### F6 Detail
+
+**Before:** `bool m_had_pos` — only fires on 1→0 transition. Closing one of two hedge legs (2→1) was invisible.  
+**After:** `int m_prev_pos_count` — fires on any reduction. Partial close records profit; full close runs reversal logic.  
+**Backward compatible:** In single-position mode, transitions are only 0↔1 — identical behavior.
+
+### State-Based Regime Detection
+
+`IsChoppy()` checks current ADX each bar. No "was trending → became choppy" edge detector. ADX oscillation near threshold causes frequent regime flips. **Future opportunity (O6):** transition-based detector.
+
+### Updated SWOT Additions
+
+**New Strengths:** S12 (partial close tracking), S13 (FIFO claims qualified), S14 (state-based documented).  
+**New Weaknesses:** W8 (ADX oscillation), W9 (LastClosedProfit same-tick edge case).  
+**New Opportunities:** O6 (transition-based regime detector).  
+**New Threats:** T8 (documentation drift risk — 6 stale comments found).
+
+### Verification (18 checks, 17 pass, 1 pending MetaEditor)
+
+All V1–V17 structural checks pass. V18 (compile) pending MetaEditor.
+
+### Resolution Summary
+
+| Scope | Count | Status |
+|---|---|---|
+| v10.13 findings | 8 | ✅ All resolved |
+| v10.14 opportunities | 3 | ✅ All implemented |
+| v10.15 spec items | 16 | ✅ All verified |
+| **v10.15 audit** | **7** | **✅ All resolved** |
+| **Open** | **1** | **MetaEditor compile + live demo** |
+
+---
+
+## References
+
+- **v10.12 Source (baseline):** 66,756 bytes, 1,785 lines, 14 classes
+- **v10.13 Source:** 1,564 lines, 13 classes, 50 inputs
+- **v10.14 Source:** 1,779 lines, 15 classes, 57 inputs, OMM6
+- **v10.15 Source (pre-audit):** 1,863 lines, 15 classes, 60 inputs
+- **v10.15 Source (post-audit):** 1,893 lines, 15 classes, 60 inputs
+- **v10.15 Post-Audit Date:** 2026-07-29
+- **Findings:** 7 items; 1 bug (F6), 4 stale, 1 minor, 1 doc; all resolved
+
+---
+
+*OneMinuteMan v10.15 (post-audit). All findings resolved: stale comments corrected, partial-close bug fixed (F6), state-vs-transition documented (F7). Pending: MetaEditor compilation, live/demo FIFO broker test.*
+
