@@ -1,8 +1,8 @@
 # OneMinuteMan v10.13/v10.14 — Verification, Comprehensive SWOT, and Critical Review
 
-**Subject:** `https://github.com/nhasibuan/g/blob/main/oneminuteman.mq4`  
-**Version Under Review:** v10.12 (baseline), v10.13 (martingale removal), v10.14 (ADX + CPerformanceTracker)  
-**Verification Date:** 2026-07-22 (v10.13), 2026-07-27 (v10.14)  
+**Subject:** `https://github.com/nhasibuan/g/blob/main/oneminuteman.mq4`
+**Version Under Review:** v10.12 (baseline), v10.13 (martingale removal), v10.14 (ADX + CPerformanceTracker)
+**Verification Date:** 2026-07-22 (v10.13), 2026-07-27 (v10.14)
 **Verification Author:** Comprehensive source audit + PLAN cross-reference
 
 ---
@@ -37,7 +37,7 @@ Audited `oneminuteman.mq4` (v10.12, 66,756 bytes / 1,785 lines) against PLAN.md 
 | V10 | `CStateStore::Save/Load` change is a "simplification" | `Save(CMartingaleController &mart, ...)` and `Load(CMartingaleController &mart, ...)` — direct **tight coupling**; removal requires **signature change + binary format change** | ⚠️ Material coupling understated |
 | V11 | Component map claims `CStateStore` is inside `CTradeExecutor` | CStateStore is independent and referenced by CExpertAdvisor (facade) | ❌ Doc/code mismatch (same as V8) |
 
-**Net Verification Status:**  
+**Net Verification Status:**
 ✅ 4 verified  |  ⚠️ 1 round-off  |  ❌ 4 discrepancies  |  ⚠️ 2 understated risks
 
 ---
@@ -627,9 +627,9 @@ v10.14 implements the two **highest-ROI opportunities** from the independent cod
 
 ## vNEXT (v10.15) — Chop-Hedging Mode: Design Spec, SWOT & Verification
 
-**Design Date:** 2026-07-28  
-**Status:** Spec approved → implemented  
-**Feature Flag:** `InpEnableChopHedge` (default `false`)  
+**Design Date:** 2026-07-28
+**Status:** Spec approved → implemented
+**Feature Flag:** `InpEnableChopHedge` (default `false`)
 
 ---
 
@@ -637,8 +637,8 @@ v10.14 implements the two **highest-ROI opportunities** from the independent cod
 
 v10.14 introduced `CAdxFilter` which *blocks* fresh entries when `ADX < InpAdxThreshold`. This correctly avoids trend-signal entries in choppy markets. However, choppy/sideways conditions represent a different opportunity: **mean-reversion / range-fade** trades. This feature adds an opt-in "chop-hedging" mode that opens a position *because* the market is choppy, rather than standing aside.
 
-**Precise definition of "choppy/sideways":**  
-`iADX(Symbol(), PERIOD_M1, InpAdxPeriod, PRICE_CLOSE, MODE_MAIN, 1) < InpAdxThreshold`  
+**Precise definition of "choppy/sideways":**
+`iADX(Symbol(), PERIOD_M1, InpAdxPeriod, PRICE_CLOSE, MODE_MAIN, 1) < InpAdxThreshold`
 This is the negation of `CAdxFilter::IsDirectional()`, exposed as the new `CAdxFilter::IsChoppy()` method (reuses the same iADX call — no new indicator).
 
 ---
@@ -783,8 +783,8 @@ This is statistically consistent with mean-reversion: in a ranging market, price
 
 ## v10.15 Post-Implementation Audit (2026-07-29)
 
-**Audit Date:** 2026-07-29  
-**Method:** Line-by-line source review of `oneminuteman.mq4` (1,863 LOC pre-fix) against all claims in README, PLAN.md, and commit messages.  
+**Audit Date:** 2026-07-29
+**Method:** Line-by-line source review of `oneminuteman.mq4` (1,863 LOC pre-fix) against all claims in README, PLAN.md, and commit messages.
 **Result:** 7 findings (F1–F7); all resolved in-place.
 
 ### Findings
@@ -801,8 +801,8 @@ This is statistically consistent with mean-reversion: in a ranging market, price
 
 ### F6 Detail
 
-**Before:** `bool m_had_pos` — only fires on 1→0 transition. Closing one of two hedge legs (2→1) was invisible.  
-**After:** `int m_prev_pos_count` — fires on any reduction. Partial close records profit; full close runs reversal logic.  
+**Before:** `bool m_had_pos` — only fires on 1→0 transition. Closing one of two hedge legs (2→1) was invisible.
+**After:** `int m_prev_pos_count` — fires on any reduction. Partial close records profit; full close runs reversal logic.
 **Backward compatible:** In single-position mode, transitions are only 0↔1 — identical behavior.
 
 ### State-Based Regime Detection
@@ -811,9 +811,9 @@ This is statistically consistent with mean-reversion: in a ranging market, price
 
 ### Updated SWOT Additions
 
-**New Strengths:** S12 (partial close tracking), S13 (FIFO claims qualified), S14 (state-based documented).  
-**New Weaknesses:** W8 (ADX oscillation), W9 (LastClosedProfit same-tick edge case).  
-**New Opportunities:** O6 (transition-based regime detector).  
+**New Strengths:** S12 (partial close tracking), S13 (FIFO claims qualified), S14 (state-based documented).
+**New Weaknesses:** W8 (ADX oscillation), W9 (LastClosedProfit same-tick edge case).
+**New Opportunities:** O6 (transition-based regime detector).
 **New Threats:** T8 (documentation drift risk — 6 stale comments found).
 
 ### Verification (18 checks, 17 pass, 1 pending MetaEditor)
@@ -846,3 +846,249 @@ All V1–V17 structural checks pass. V18 (compile) pending MetaEditor.
 
 *OneMinuteMan v10.15 (post-audit). All findings resolved: stale comments corrected, partial-close bug fixed (F6), state-vs-transition documented (F7). Pending: MetaEditor compilation, live/demo FIFO broker test.*
 
+
+---
+
+## vNEXT (v10.16) — Transition-Gated Chop Hedging: Design Spec, SWOT & Review
+
+**Design Date:** 2026-07-29
+**Status:** Implemented in v10.16 bug fix; transition mode is now the only chop-hedge trigger
+**User Requirement:** Open chop-hedging positions **only when ADX transitions back from trend into choppy/sideways market**, not merely because current ADX is below `InpAdxThreshold`.
+
+---
+
+### 1. Plain-English Explanation
+
+Current v10.15 chop-hedging is **state-based**: if `ADX < InpAdxThreshold` on the closed M1 bar, the market is considered choppy and `ManageChopHedge()` may open a mean-reversion position on every eligible new bar.
+
+The requested v10.16 behaviour is **transition-based**:
+
+1. The EA must first observe a **trend regime**: `ADX >= InpAdxThreshold`.
+2. Then ADX must cross **back below** the threshold: previous closed-bar ADX was trending, current closed-bar ADX is choppy.
+3. Only on that **trend → chop transition event** may the EA open a chop-hedge position.
+4. While ADX remains below the threshold, no additional hedge should be opened solely because the market is still choppy.
+5. The trigger re-arms only after ADX returns to trend again.
+
+This prevents repeated hedge entries during long sideways periods and turns chop-hedging from a continuous regime state into a one-shot transition event.
+
+---
+
+### 2. Formal Requirement
+
+#### Regime Definitions
+
+Using closed M1 bars only:
+
+```mql4
+adx_now  = iADX(Symbol(), PERIOD_M1, InpAdxPeriod, PRICE_CLOSE, MODE_MAIN, 1);
+adx_prev = iADX(Symbol(), PERIOD_M1, InpAdxPeriod, PRICE_CLOSE, MODE_MAIN, 2);
+```
+
+| Regime | Predicate |
+|---|---|
+| `ADX_REGIME_UNKNOWN` | `adx <= 0.0` or `adx == EMPTY_VALUE` |
+| `ADX_REGIME_TREND` | `adx >= InpAdxThreshold` |
+| `ADX_REGIME_CHOP` | `adx < InpAdxThreshold` |
+
+#### Transition Trigger
+
+A chop-hedge trigger is valid only when:
+
+```mql4
+prev_regime == ADX_REGIME_TREND && current_regime == ADX_REGIME_CHOP
+```
+
+Equivalently:
+
+```mql4
+adx_prev >= InpAdxThreshold && adx_now < InpAdxThreshold
+```
+
+The comparison must use closed bars (`shift 2` → `shift 1`) to avoid intrabar repaint/noise.
+
+---
+
+### 3. New Inputs
+
+| Input | Default | Purpose |
+|---|---:|---|
+| `InpChopRearmBars` | `1` | Number of consecutive trend bars required before a new trend→chop trigger can fire again. |
+| `InpAdxHysteresis` | `0.0` | Optional deadband around `InpAdxThreshold` to reduce flip-flop; `0.0` preserves exact threshold semantics. |
+
+No compatibility mode is added: v10.16 intentionally fixes the executable chop-hedge trigger so state-based hedge entry is no longer available.
+
+---
+
+### 4. State Machine Design
+
+#### State Variables
+
+| Variable | Type | Meaning |
+|---|---|---|
+| `InpChopRearmBars` | `input int` | Consecutive prior trend bars required by `CAdxFilter::ChopTransitionTriggered()` |
+| `InpAdxHysteresis` | `input double` | Deadband added/subtracted around `InpAdxThreshold` |
+| Closed-bar shifts | `ADX[1]`, `ADX[2..]` | Duplicate prevention is inherent because `ManageChopHedge()` runs once per new bar and the crossing predicate is false after the crossing bar |
+
+Suggested enum:
+
+```mql4
+enum ENUM_ADX_REGIME {
+   ADX_REGIME_UNKNOWN = 0,
+   ADX_REGIME_CHOP    = 1,
+   ADX_REGIME_TREND   = 2
+};
+```
+
+#### Transition Logic
+
+```mql4
+bool CAdxFilter::ChopTransitionTriggered() {
+   double adxNow  = Value(1);
+   double adxPrev = Value(2);
+   if(!Valid(adxNow) || !Valid(adxPrev)) return false;
+
+   double trendEnter = InpAdxThreshold + InpAdxHysteresis;
+   double chopEnter  = InpAdxThreshold - InpAdxHysteresis;
+
+   bool wasTrend = (adxPrev >= trendEnter);
+   bool nowChop  = (adxNow  <  chopEnter);
+   return wasTrend && nowChop;
+}
+```
+
+If `InpAdxHysteresis == 0.0`, this exactly implements `adx_prev >= InpAdxThreshold && adx_now < InpAdxThreshold`.
+
+---
+
+### 5. Revised `ManageChopHedge()` Gate Order
+
+All gates must pass:
+
+1. `InpEnableChopHedge == true`
+2. `InpEnableTrading == true`
+3. `allowFresh == true` — only evaluate once per new M1 bar
+4. `InpUseAdxFilter == true` — required for regime data
+5. `m_adx.ChopTransitionTriggered()` — **trend → chop transition only**
+6. `CountPositions() < InpMaxHedgeLegs`
+7. `TradingWindowOpen()`
+8. `m_spread.SpreadOK()`
+9. `EquityGuardOK()`
+10. `InpMaxTradesPerDay == 0 || m_trades_today < InpMaxTradesPerDay`
+11. `!m_reversal_pending` — loss reversal has priority
+
+Direction, lot sizing, and execution remain unchanged from v10.15: fade the range midpoint with `InpHedgeLots` or `InpBaseLots`.
+
+---
+
+### 6. Acceptance Criteria
+
+| ID | Requirement | Verification |
+|---|---|---|
+| AC1 | No hedge opens merely because `ADX < InpAdxThreshold` for many bars | Unit/log replay shows only one trigger on the crossing bar |
+| AC2 | Hedge opens when ADX crosses from `>= threshold` to `< threshold` and all other gates pass | Strategy Tester log contains `ChopTransition fired` on crossing bar |
+| AC3 | Hedge does not re-fire until ADX spends `InpChopRearmBars` consecutive bars back in trend | Replay ADX sequence: trend→chop→chop→trend→chop |
+| AC4 | Closed-bar ADX is used; intrabar threshold flicker cannot trigger | Code uses shifts 1 and 2 only |
+| AC5 | State-based v10.15 behaviour is removed from executable hedge entry | Code uses `ChopTransitionTriggered()` instead of `IsChoppy()` |
+| AC6 | Default remains safe for FIFO users | `InpEnableChopHedge=false` remains unchanged |
+| AC7 | On-chart panel identifies trigger mode and current/previous ADX regime | Panel row: `Hedge:ON mode:TRANS prev:TREND now:CHOP` |
+
+---
+
+### 7. Comprehensive SWOT — Transition-Gated Chop Hedging
+
+#### Strengths
+
+| ID | Strength | Evidence / Why It Matters |
+|---|---|---|
+| **ST1** | Reduces over-trading in extended sideways markets | One-shot transition trigger replaces state-based repeated eligibility. |
+| **ST2** | Better matches the user intent: hedge only when trend degrades into chop | Formal predicate is `adx_prev >= threshold && adx_now < threshold`. |
+| **ST3** | Uses closed-bar ADX only | Avoids intrabar threshold flicker and look-ahead bias. |
+| **ST4** | Safer than a compatibility switch | State-based hedge entry is removed, preventing accidental re-enable of the bug. |
+| **ST5** | Re-arm rule makes exposure frequency enumerable | `InpChopRearmBars` controls how often a new transition can produce hedge exposure. |
+| **ST6** | Hysteresis can reduce ADX threshold noise | `InpAdxHysteresis` creates a deadband around the threshold. |
+
+#### Weaknesses
+
+| ID | Weakness | Evidence / Why It Matters |
+|---|---|---|
+| **WT1** | May miss profitable range-fade trades after chop is already established | By design, only crossing bars trigger. |
+| **WT2** | Adds state-machine complexity | Requires previous/current regime, rearm count, and duplicate-bar guard. |
+| **WT3** | Sensitive to threshold and hysteresis calibration | Poor `InpAdxThreshold` can classify regimes incorrectly. |
+| **WT4** | Transition is not proof of safe range conditions | ADX crossing down may also precede a volatile reversal or news-driven whipsaw. |
+| **WT5** | Requires testable ADX sequence logging | Without logs, users cannot verify whether a non-entry was due to no transition or another gate. |
+
+#### Opportunities
+
+| ID | Opportunity | Why It Matters |
+|---|---|---|
+| **OT1** | Add regime-transition telemetry for optimization | CSV columns for `adx_prev`, `adx_now`, `prev_regime`, `current_regime`, and trigger result. |
+| **OT2** | A/B test state vs transition modes | Quantifies whether fewer, higher-quality hedge entries improve expectancy. |
+| **OT3** | Add multi-bar confirmation | Require `N` bars below threshold after crossing before hedge entry. |
+| **OT4** | Promote `CAdxFilter` into a full `CRegimeDetector` | Encapsulates ADX state, hysteresis, rearming, and diagnostics. |
+
+#### Threats
+
+| ID | Threat | Severity | Mitigation |
+|---|---|---|---|
+| **TT1** | ADX lag means the transition fires late | Medium | Validate with walk-forward tests; consider shorter `InpAdxPeriod` only after optimization. |
+| **TT2** | Threshold oscillation can still create frequent triggers | High | Use `InpAdxHysteresis > 0` and `InpChopRearmBars > 1`. |
+| **TT3** | Hedging remains FIFO/prop-firm incompatible when enabled | High | Keep `InpEnableChopHedge=false` by default and preserve warning in `OnInit()`. |
+| **TT4** | Breakout resumes immediately after trend→chop crossing | High | Keep hard exposure cap, VSL, spread gate, equity guard, and max-trade cap. |
+| **TT5** | Documentation drift between trigger modes | Medium | README and PLAN must explicitly say v10.16 default is transition-based, not state-based. |
+
+---
+
+### 8. Verification & Review Summary
+
+**Spec Review Result:** ✅ The transition-gated design satisfies the requirement: hedge positions are opened only when ADX returns from trending to choppy/sideways (`ADX >= threshold` → `ADX < threshold`).
+
+**Implementation Impact:** Completed. The existing `CAdxFilter::IsChoppy()` remains for display, while executable hedge entry now uses `CAdxFilter::ChopTransitionTriggered(InpChopRearmBars)`.
+
+**Recommendation:** Validate v10.16 in Strategy Tester with ADX transition logs before demo/live validation. Keep `InpEnableChopHedge=false` for FIFO, netting, and prop-firm accounts.
+
+---
+
+## v10.16 Implementation Review — Transition-Gated Chop-Hedging Bug Fix (2026-07-29)
+
+**Status:** Implemented in `oneminuteman.mq4`, presets, README, and this PLAN.
+
+### Bug Fixed
+
+v10.15 used state-based chop detection: every eligible new bar with `ADX < InpAdxThreshold` could open a chop-hedge leg. That contradicted the refined requirement to open hedging positions **only when ADX returns from trend to choppy/sideways conditions**.
+
+v10.16 changes the executable trigger to closed-bar transition detection:
+
+```mql4
+ADX[1] < InpAdxThreshold - InpAdxHysteresis
+AND each of ADX[2..1+InpChopRearmBars] >= InpAdxThreshold + InpAdxHysteresis
+```
+
+With defaults (`InpChopRearmBars=1`, `InpAdxHysteresis=0.0`), this is exactly:
+
+```mql4
+ADX[2] >= InpAdxThreshold && ADX[1] < InpAdxThreshold
+```
+
+### Code Changes Verified
+
+| Area | Verification |
+|---|---|
+| Inputs | Added `InpChopRearmBars` and `InpAdxHysteresis`; total inputs now 62. |
+| `CAdxFilter` | Added shift-aware `Value(int shift)` and `ChopTransitionTriggered(int rearmBars)`. |
+| Hedge gate | `ManageChopHedge()` now calls `m_adx.ChopTransitionTriggered(InpChopRearmBars)` instead of `m_adx.IsChoppy()`. |
+| Validation | `OnInit()` rejects `InpChopRearmBars < 1` and `InpAdxHysteresis < 0`. |
+| Telemetry | Hedge log now prints both current ADX and previous ADX; panel shows `HEDGE-TRIGGER` only on transition bars. |
+| Presets | `conservative.set` and `ftmo_challenge.set` include transition defaults while keeping `InpEnableChopHedge=0`. |
+
+### Updated SWOT Delta
+
+| Type | Finding |
+|---|---|
+| Strength | Fix prevents repeated hedge entries just because ADX remains below threshold. |
+| Weakness | Fewer hedge entries means some mature-range mean-reversion opportunities are intentionally skipped. |
+| Opportunity | `InpChopRearmBars` and `InpAdxHysteresis` can be optimized per symbol/session in Strategy Tester. |
+| Threat | ADX is lagging; a trend→chop transition can still occur immediately before breakout continuation, so VSL/equity/trade caps remain mandatory. |
+
+### Review Verdict
+
+✅ The bug fix satisfies the requested behavior: chop-hedging opens only after ADX was trending and then returns to choppy/sideways on closed M1 bars. The feature remains opt-in and FIFO-breaking; default presets keep it disabled.
