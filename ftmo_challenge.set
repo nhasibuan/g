@@ -1,9 +1,9 @@
-; OneMinuteMan v10.14 -- FTMO Challenge Profile
+; OneMinuteMan v10.16 -- FTMO Challenge Profile
 ; Target: prop-firm rules (FTMO, MFF, The5ers typical)
 ; Max daily loss: 5%, max total loss: 10%, profit target: 10%
 ; Risk: conservative 0.01 base lots, ADX filter ON, win-rate halt ON
 ; IMPORTANT: Set InpEnableTrading=1 only after reading all risk warnings
-; Last updated: 2026-07-27
+; Last updated: 2026-07-29
 
 InpSampleMs=50
 InpWindowSize=1200
@@ -65,5 +65,7 @@ InpWinRateWindow=20
 InpMinWinRate=0.45
 InpReversalArmTimeoutSec=180
 InpEnableChopHedge=0
+InpChopHedgeTrigger=1
 InpHedgeLots=0.0
 InpMaxHedgeLegs=2
+InpBreakoutExit=1

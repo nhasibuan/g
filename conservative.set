@@ -1,7 +1,7 @@
-; OneMinuteMan v10.14 -- Conservative Profile
+; OneMinuteMan v10.16 -- Conservative Profile
 ; Suitable for personal accounts, low-risk demo testing
 ; Risk: ~1-2% per trade, 5% daily max drawdown
-; Last updated: 2026-07-27
+; Last updated: 2026-07-29
 
 InpSampleMs=50
 InpWindowSize=1200
@@ -63,5 +63,7 @@ InpWinRateWindow=20
 InpMinWinRate=0.45
 InpReversalArmTimeoutSec=300
 InpEnableChopHedge=0
+InpChopHedgeTrigger=1
 InpHedgeLots=0.0
 InpMaxHedgeLegs=2
+InpBreakoutExit=1
