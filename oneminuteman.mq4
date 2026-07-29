@@ -5,9 +5,14 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, nhasibuan"
 #property link      "https://github.com/nhasibuan/g"
-#property version   "10.16"
+#property version   "10.16.1"
 #property strict
-#property description "OneMinuteMan v10.16: Signal-only M1 scalper with event-driven loss-reversal and transition-based chop-hedging."
+#property description "OneMinuteMan v10.16.1: Signal-only M1 scalper with event-driven loss-reversal and transition-based chop-hedging."
+// v10.16.1 BUG FIX: JustBecameChoppy() was always-false because UpdateRegime()
+// and JustBecameChoppy() both read iADX(shift=1) on the same tick, making the
+// condition (ADX<thr AND ADX>=thr) a logical impossibility. TRANSITION mode
+// silently never fired. Fixed by replacing the stateful state machine with the
+// stateless ChopTransitionTriggered() which compares ADX[1] vs ADX[2..N].
 #property description "No martingale. Fixed linear risk. FIFO/netting compatible by default (chop-hedge breaks FIFO when enabled)."
 #property description "ATR-dynamic risk, virtual SL with safety net, break-even, persistent equity guards."
 
@@ -613,13 +618,20 @@ public:
 
 //==================================================================
 //==================================================================
-// SECTION 7b -- CAdxFilter : ADX trend-strength regime filter (v10.14/v10.15/v10.16)
+// SECTION 7b -- CAdxFilter : ADX trend-strength regime filter (v10.14/v10.15/v10.16.1)
 //==================================================================
 // v10.14: Prevents entries in choppy/sideways markets (ADX < threshold).
 // v10.15: Adds IsChoppy() for chop-hedging mode (inverse of IsDirectional).
-// v10.16: Adds transition detection — JustBecameChoppy() fires only on the
-//         trend→chop edge (prior bar directional, current bar choppy).
-//         Implements O6 from the v10.15 post-audit.
+// v10.16: Added transition detection intent (O6 from v10.15 audit).
+// v10.16.1 BUG FIX: The v10.16 state machine (JustBecameChoppy + UpdateRegime)
+//   was ALWAYS FALSE because both methods read iADX(shift=1) on the same tick,
+//   making the condition (ADX<thr AND ADX>=thr) logically impossible.
+//   TRANSITION mode silently never fired — the feature did not exist at runtime.
+//   FIX: Replaced the broken stateful approach with the stateless closed-bar
+//   predicate ChopTransitionTriggered(rearmBars), which compares ADX[1] vs
+//   ADX[2..1+rearmBars] across DIFFERENT bars. Deleted: m_prev_directional,
+//   m_regime_initialized, JustBecameChoppy(), UpdateRegime(), WasDirectional(),
+//   IsRegimeInitialized().
 // Addresses W9 (no ADX filter) and T4 (choppy market losses) from audit.
 class CAdxFilter {
 private:
@@ -627,8 +639,6 @@ private:
    int    m_period;
    double m_threshold;
    double m_hysteresis;         // v10.16: hysteresis band width (default 0.0 = disabled)
-   bool   m_prev_directional;  // v10.16: prior bar's regime (true=trending, false=choppy)
-   bool   m_regime_initialized; // v10.16: false until first UpdateRegime() call
 
 public:
    // Init signature unchanged from v10.14 (3 params) to avoid breaking callers.
@@ -638,8 +648,6 @@ public:
       m_period    = (period > 0) ? period : 14;
       m_threshold = (threshold > 0.0) ? threshold : 20.0;
       m_hysteresis = 0.0;       // default: no hysteresis band
-      m_prev_directional  = true;  // assume trending until proven otherwise (safe default)
-      m_regime_initialized = false;
    }
 
    // v10.16: Set hysteresis band width. Call after Init().
@@ -668,34 +676,6 @@ public:
       return (adx < m_threshold);
    }
 
-   // v10.16 (O6): Returns true ONLY on the trend→chop transition edge.
-   // Requires prior call to UpdateRegime() on each new bar.
-   // Returns false if regime was not yet initialized (first bar after init).
-   bool JustBecameChoppy() {
-      if(!m_enabled || !m_regime_initialized) return false;
-      // Current bar must be choppy AND prior bar must have been directional
-      return (!IsDirectional() && m_prev_directional);
-   }
-
-   // v10.16: Call once per new bar to latch the prior regime state.
-   // Must be called BEFORE IsChoppy()/JustBecameChoppy() on the same bar.
-   void UpdateRegime() {
-      if(!m_enabled) return;
-      // On the first call, just initialize and don't fire transition
-      bool currentlyDirectional = IsDirectional();
-      if(m_regime_initialized) {
-         m_prev_directional = currentlyDirectional;
-      } else {
-         // First bar: latch current state, mark as initialized
-         m_prev_directional  = currentlyDirectional;
-         m_regime_initialized = true;
-      }
-   }
-
-   // v10.16: Expose the prior bar's regime for UpdateComment() panel
-   bool WasDirectional() const { return m_prev_directional; }
-   bool IsRegimeInitialized() const { return m_regime_initialized; }
-
    // Returns ADX value for the most recent closed bar (shift=1). No arguments.
    // Used by UpdateComment(), ChopHedge print, BreakoutExit print.
    double Value() {
@@ -710,9 +690,15 @@ public:
       return (adx == EMPTY_VALUE) ? 0.0 : adx;
    }
 
-   // v10.16 bug fix: true only when ADX moves from trend back into chop.
-   // Uses closed bars only: shifts 2..N+1 must be trend, shift 1 must be chop.
-   // Uses hysteresis band when m_hysteresis > 0.
+   // v10.16/v10.16.1: Stateless closed-bar predicate for trend->chop transition.
+   // Returns true ONLY when ADX has crossed from trend back into chop:
+   //   ADX[1] < threshold - hysteresis  (current bar is choppy)
+   //   ADX[2..1+rearmBars] >= threshold + hysteresis  (prior bars were trending)
+   // This is the CORRECT implementation of the user requirement:
+   //   "only if InpAdxThreshold back to choppy/sideways from trend"
+   // Structurally guarantees single-fire: the transition pair (bar_N-1, bar_N)
+   // occupies shifts (2,1) only on bar_N+1's opening tick; next bar it ages
+   // out of window. No state machine needed.
    bool ChopTransitionTriggered(int rearmBars=1) {
       if(!m_enabled) return false;
       int bars = (rearmBars > 1) ? rearmBars : 1;
@@ -1667,10 +1653,13 @@ private:
       if(!InpEnableChopHedge || !InpEnableTrading) return;
       if(!allowFresh)                              return; // fire on new bar only
 
-      // v10.16: Select trigger mode
+      // v10.16.1: Select trigger mode
+      // TRANSITION uses stateless closed-bar predicate ChopTransitionTriggered()
+      // which compares ADX[1] vs ADX[2..1+rearmBars] across different bars.
+      // (v10.16 JustBecameChoppy was ALWAYS FALSE — see class header comment.)
       bool shouldFire;
       if(InpChopHedgeTrigger == CHOP_TRIGGER_TRANSITION) {
-         shouldFire = m_adx.JustBecameChoppy(); // fires only on trend->chop edge
+         shouldFire = m_adx.ChopTransitionTriggered(InpChopRearmBars); // v10.16.1 fix
       } else {
          shouldFire = m_adx.IsChoppy();          // v10.15 behavior: fires every choppy bar
       }
@@ -1733,7 +1722,7 @@ private:
       if(now == m_last_comment_time) return; // skip if already updated this second
       m_last_comment_time = now;
 
-      string msg = "=== OneMinuteMan v10.16 (no-mart) ===\n";
+      string msg = "=== OneMinuteMan v10.16.1 (no-mart) ===\n";
       msg += StringFormat("Symbol:%-6s  Engine:%s\n", Symbol(), TFLabel());
       msg += "--- Range ---\n";
       msg += StringFormat("High:%.5f  Low:%.5f  Range:%.5f\n",
@@ -1746,17 +1735,17 @@ private:
          msg += StringFormat("PPM:%.2f  Zone:%s\n", m_ppm.ppm, PpmZoneName(m_ppm.zone));
       if(InpUseAdxFilter) {
          bool chop = m_adx.IsChoppy();
-         bool wasDir = m_adx.WasDirectional();
          string regimeTag = !chop ? "TREND" : "CHOP";
          string edgeTag = "";
          if(InpEnableChopHedge && chop) {
             if(InpChopHedgeTrigger == CHOP_TRIGGER_TRANSITION)
-               edgeTag = wasDir ? " [EDGE!]" : " [chop-cont]";
+               // v10.16.1: Use the SAME predicate as ManageChopHedge (single source of truth)
+               edgeTag = m_adx.ChopTransitionTriggered(InpChopRearmBars) ? " [EDGE!]" : " [chop-cont]";
             else
                edgeTag = " [HEDGE-ARM]";
          }
-         msg += StringFormat("ADX:%.1f %s (thr:%.0f)%s\n",
-                             m_adx.Value(), regimeTag, InpAdxThreshold, edgeTag);
+         msg += StringFormat("ADX:%.1f %s (thr:%.0f hyst:%.0f)%s\n",
+                             m_adx.Value(), regimeTag, InpAdxThreshold, InpAdxHysteresis, edgeTag);
       }
       // v10.15/v10.16: Chop-hedge status row
       if(InpEnableChopHedge)
@@ -1978,7 +1967,8 @@ public:
       bool newBar = IsNewBar();
 
       if(newBar) {
-         m_adx.UpdateRegime(); // v10.16: latch prior regime BEFORE candle recognition
+         // v10.16.1: UpdateRegime() DELETED — was part of the always-false state machine.
+         // ChopTransitionTriggered() is stateless; reads closed bars directly.
          CANDLE_STRUCTURE bar;
          if(m_candle_engine.Recognize(1, bar)) {
             m_candle       = bar;

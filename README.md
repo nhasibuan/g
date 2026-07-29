@@ -4,9 +4,9 @@
 
 ## Overview
 
-**OneMinuteMan (OMM)** is a single-file, component-based MQL4 Expert Advisor at **version 10.16**, designed for M1 (1-minute) timeframe scalping. Built by [Norman Hasibuan](https://github.com/nhasibuan) with AI-assisted development, it combines candlestick pattern recognition, a ZigZag-based Pips-Per-Minute (PPM) momentum engine, an **ADX regime filter** (with configurable transition-based or state-based chop-hedging), ATR-dynamic risk management, virtual stop-losses, an event-driven loss-reversal system, and a **rolling win-rate performance tracker**.
+**OneMinuteMan (OMM)** is a single-file, component-based MQL4 Expert Advisor at **version 10.16.1**, designed for M1 (1-minute) timeframe scalping. Built by [Norman Hasibuan](https://github.com/nhasibuan) with AI-assisted development, it combines candlestick pattern recognition, a ZigZag-based Pips-Per-Minute (PPM) momentum engine, an **ADX regime filter** (with stateless transition-based chop-hedging), ATR-dynamic risk management, virtual stop-losses, an event-driven loss-reversal system, and a **rolling win-rate performance tracker**.
 
-**v10.16 adds transition-based regime detection and breakout exit.** The chop-hedge trigger is now configurable: **TRANSITION mode** (default) fires only on the trend→chop edge, eliminating false re-firings on consecutive choppy bars. **BreakoutExit** closes hedge legs when ADX returns to directional, mitigating the breakout-from-range threat. Both features are opt-in behind `InpEnableChopHedge = false` (default OFF).
+**v10.16.1 fixes a critical bug**: the v10.16 TRANSITION mode chop-hedge trigger was **always false** due to a same-tick ADX read in the state machine (`UpdateRegime` + `JustBecameChoppy` both read `iADX(shift=1)`, making `(X<thr AND X>=thr)` logically impossible). The fix replaces the broken stateful approach with the **stateless closed-bar predicate** `ChopTransitionTriggered()`, which compares ADX[1] vs ADX[2..N] across different bars. The broken state machine has been deleted. `InpChopRearmBars` and `InpAdxHysteresis` are now runtime-effective (were dead inputs in v10.16).
 
 The EA forcibly operates on M1 candle data regardless of the chart timeframe, enabling focused 1-minute scalping strategy with comprehensive protection.
 
@@ -16,7 +16,7 @@ The EA forcibly operates on M1 candle data regardless of the chart timeframe, en
 
 **OneMinuteMan** is a MetaTrader 4 Expert Advisor (EA) written in MQL4, designed for M1 (1‑minute) scalping with **fixed linear risk** and comprehensive risk mitigations. It's a single `.mq4` file, internally organized into **15 single‑responsibility classes** behind a `CExpertAdvisor` facade.
 
-**v10.16:** Transition-based chop-hedge trigger (default) fires only on the trend→chop edge. Breakout exit closes hedge legs when ADX returns to directional. Both configurable via `InpChopHedgeTrigger` and `InpBreakoutExit`.
+**v10.16.1:** Critical fix — TRANSITION chop-hedge trigger was always-false in v10.16 (state machine bug). Now uses stateless `ChopTransitionTriggered()` predicate. `InpChopRearmBars` and `InpAdxHysteresis` activated. Breakout exit closes hedge legs when ADX returns to directional.
 
 ---
 
@@ -47,7 +47,7 @@ The EA is structured as a **single-file component architecture** using classic O
 - **`CCandleEngine`** — Classifies 11 candlestick types (Hammer, Marubozu, 3 Doji variants, Long/Short, Spinning Top, Inverted Hammer) and derives trend direction vs SMA
 - **`CPpmEngine`** — Uses ZigZag indicator to compute pips-per-minute efficiency; classifies zones as LOW / MEDIUM / HIGH
 - **`CVolumeFilter`** — Tick-volume spike gate; blocks entries when volume is below threshold to ensure liquidity confirmation
-- **`CAdxFilter`** _(v10.14/v10.15/v10.16)_ — ADX trend-strength regime filter: blocks fresh entries in choppy markets (v10.14), optionally opens mean-reversion range-fade positions in chop via `InpEnableChopHedge` (v10.15), and supports configurable trigger modes — STATE (fire every choppy bar) or TRANSITION (fire only on trend→chop edge, v10.16)
+- **`CAdxFilter`** _(v10.14/v10.15/v10.16.1)_ — ADX trend-strength regime filter: blocks fresh entries in choppy markets (v10.14), optionally opens mean-reversion range-fade positions in chop via `InpEnableChopHedge` (v10.15), and supports a stateless transition trigger `ChopTransitionTriggered()` that fires only on trend→chop crossing (v10.16.1 fix)
 
 #### Session, Risk & Performance
 - **`CSessionClock`** — Timezone-aware session window; daily halt flag persists across restarts
@@ -326,12 +326,14 @@ The EA can optionally open a reverse-direction position **after a losing close**
 | `InpMinWinRate` | `0.45` | Minimum acceptable win-rate; auto-halt if below (requires full window) |
 | **v10.14 — Reversal Safety** | | |
 | `InpReversalArmTimeoutSec` | `300` | Auto-disarm reversal if not fired within N seconds; `0` = off |
-| **v10.15/v10.16 — Chop-Hedging Engine** | | |
+| **v10.15/v10.16.1 — Chop-Hedging Engine** | | |
 | `InpEnableChopHedge` | `false` | **Enable chop-hedging (FIFO-BREAKING; default OFF).** Opens mean-reversion position when `ADX < InpAdxThreshold`. Requires `InpUseAdxFilter=true`. |
-| `InpChopHedgeTrigger` | `TRANSITION` | **Trigger mode**: `STATE` fires every choppy bar (v10.15 behavior); `TRANSITION` fires only on the trend→chop edge (v10.16). |
+| `InpChopHedgeTrigger` | `TRANSITION` | **Trigger mode**: `STATE` fires every choppy bar (v10.15 behavior); `TRANSITION` fires only on the trend→chop edge via stateless `ChopTransitionTriggered()` (v10.16.1 fix). |
+| `InpChopRearmBars` | `1` | Number of consecutive trend bars required before a new trigger can fire. Higher = stricter confirmation. |
+| `InpAdxHysteresis` | `0.0` | Dead zone around threshold: enter chop at `thr−hyst`, exit at `thr+hyst`. `0` = exact threshold. |
 | `InpHedgeLots` | `0.0` | Lot size for hedge legs; `0.0` = use `InpBaseLots` |
 | `InpMaxHedgeLegs` | `2` | Maximum concurrent chop-hedge legs (hard exposure cap) |
-| `InpBreakoutExit` | `true` | Close all hedge legs when ADX returns to directional (breakout detection, v10.16 TH2 mitigation) |
+| `InpBreakoutExit` | `true` | Close all hedge legs when ADX returns to directional (breakout detection, TH2 mitigation) |
 
 ---
 
@@ -349,9 +351,9 @@ Two preset files are shipped with the EA. Load them via MT4 Strategy Tester → 
 
 ## Overall Assessment
 
-**OneMinuteMan v10.16** is a technically sophisticated, well-documented MT4 scalping EA with fixed linear risk, comprehensive persistent risk controls, and a clean signal-only architecture. v10.16 adds a **configurable transition-based regime detector** (O6 from the v10.15 audit) and **breakout-exit for hedge legs** (TH2 mitigation). Default trigger mode is TRANSITION — fires only on the trend→chop edge, eliminating false re-firings on consecutive choppy bars.
+**OneMinuteMan v10.16.1** is a technically sophisticated, well-documented MT4 scalping EA with fixed linear risk, comprehensive persistent risk controls, and a clean signal-only architecture. v10.16.1 fixes a **critical runtime defect**: the v10.16 TRANSITION chop-hedge trigger was always-false due to a same-tick ADX read in the state machine. The fix replaces the broken state machine with a **stateless closed-bar predicate** `ChopTransitionTriggered()`, activates `InpChopRearmBars`/`InpAdxHysteresis`, and deletes the dead code. Breakout exit (TH2) remains functional.
 
-A post-implementation audit (v10.15, 2026-07-29) found and resolved 7 issues including 1 bug (F6: partial hedge-leg closures not tracked). v10.16 resolves the transition-vs-state gap (O6) and adds breakout protection (TH2). See PLAN.md for full history.
+See PLAN.md v10.16.1 section for full root cause analysis, truth table, and SWOT.
 
 ### Summary
 
@@ -363,7 +365,7 @@ A post-implementation audit (v10.15, 2026-07-29) found and resolved 7 issues inc
 | **Documentation** | ⭐⭐⭐⭐ | Clear README, comprehensive SWOT, preset profiles, but no official backtest results |
 | **Backtesting** | ⭐⭐ | No walk-forward results provided |
 | **FIFO Compatibility** | ⭐⭐⭐⭐ | Designed for FIFO/netting; needs live broker validation |
-| **Chop-Hedge** | ⭐⭐⭐⭐ | Clean transition-based trigger (v10.16), breakout exit, but no backtest evidence |
+| **Chop-Hedge** | ⭐⭐⭐⭐ | Stateless transition trigger (v10.16.1 fix), breakout exit, but no backtest evidence |
 
 ### Primary Caveats
 
@@ -373,8 +375,8 @@ A post-implementation audit (v10.15, 2026-07-29) found and resolved 7 issues inc
 4. **Reverse Leg Risk**: Both-leg losses (original + reverse) double per-cycle drawdown; `InpMaxReverseLossesPerDay` mitigates but does not eliminate this risk
 5. **Breaking Change from v10.12**: All martingale inputs removed; `.set` files must be recreated; state files are incompatible (OMM4 → OMM5)
 6. **Chop-Hedge Risk (v10.15+)**: When `InpEnableChopHedge=true`, multiple concurrent positions are opened. This breaks FIFO/netting compatibility and the fixed-linear-risk guarantee. Maximum exposure = `InpMaxHedgeLegs × InpHedgeLots`. Do not enable on prop-firm or netting broker accounts.
-7. **Trigger Mode Matters (v10.16)**: TRANSITION mode (default) fires at most once per regime switch — safe and predictable. STATE mode fires every choppy bar — more aggressive, may open multiple legs rapidly near the ADX threshold.
-8. **False Breakout Risk (v10.16)**: `InpBreakoutExit=true` closes hedge legs when ADX spikes above threshold. A 1-bar false breakout can close legs prematurely.
+7. **v10.16 TRANSITION Bug (Fixed in v10.16.1)**: The v10.16 state machine (`JustBecameChoppy` + `UpdateRegime`) was always-false. If you used v10.16 with TRANSITION mode, chop-hedging silently never fired. Upgrade to v10.16.1.
+8. **False Breakout Risk**: `InpBreakoutExit=true` closes hedge legs when ADX spikes above threshold. A 1-bar false breakout can close legs prematurely.
 
 ### Recommendation
 
@@ -394,11 +396,11 @@ A post-implementation audit (v10.15, 2026-07-29) found and resolved 7 issues inc
 
 - **Repository**: [nhasibuan/g](https://github.com/nhasibuan/g)
 - **Author**: [Norman Hasibuan (@nhasibuan)](https://github.com/nhasibuan)
-- **Latest Version**: v10.16 (July 29, 2026) — transition-based chop-hedge trigger (O6), breakout exit (TH2), configurable trigger mode
+- **Latest Version**: v10.16.1 (July 30, 2026) — **critical bug fix**: TRANSITION chop-hedge trigger was always-false in v10.16; replaced with stateless `ChopTransitionTriggered()`
 - **License**: [MIT](LICENSE)
 - **Contributing**: [CONTRIBUTING.md](CONTRIBUTING.md)
 - **For Issues/Questions**: Refer to repository documentation and risk warnings
 
 ---
 
-*OneMinuteMan v10.16 is a disciplined, signal-only M1 scalper. Fixed risk per trade. No martingale. No compounding. 62 configurable inputs. 15 SRP classes. 12 serial entry guards. Configurable chop-hedge trigger (TRANSITION or STATE, default TRANSITION). Breakout exit closes hedge legs on regime change. Demo thoroughly and trade responsibly.*
+*OneMinuteMan v10.16.1 is a disciplined, signal-only M1 scalper. Fixed risk per trade. No martingale. No compounding. 64 configurable inputs. 15 SRP classes. 12 serial entry guards. Stateless chop-hedge trigger (TRANSITION default, STATE available). InpChopRearmBars + InpAdxHysteresis now runtime-effective. Breakout exit closes hedge legs on regime change. Demo thoroughly and trade responsibly.*

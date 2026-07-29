@@ -1381,3 +1381,137 @@ ADX[2] >= InpAdxThreshold && ADX[1] < InpAdxThreshold
 ### Review Verdict
 
 ✅ The bug fix satisfies the requested behavior: chop-hedging opens only after ADX was trending and then returns to choppy/sideways on closed M1 bars. The feature remains opt-in and FIFO-breaking; default presets keep it disabled.
+
+---
+
+## v10.16.1 — Chop-Hedge Transition Trigger Bug Fix (2026-07-30)
+
+### Root Cause: Always-False Predicate (Runtime Defect, Not Documentation Drift)
+
+The v10.16 TRANSITION mode was **non-functional at runtime**. The state machine (`JustBecameChoppy()` + `UpdateRegime()`) contained a logical impossibility:
+
+```
+OnTickHandler (new bar tick):
+  Step 1: m_adx.UpdateRegime()       // latches m_prev_directional = IsDirectional()
+                                     //   → reads iADX(shift=1) → ADX[1]
+  Step 2: ManageChopHedge(newBar)    // → JustBecameChoppy()
+                                     //   = !IsDirectional() && m_prev_directional
+                                     //   = (ADX[1] < thr) && (ADX[1] >= thr)
+                                     //   ≡ FALSE  (always)
+```
+
+Both `UpdateRegime()` and `JustBecameChoppy()` read `iADX(Symbol(), PERIOD_M1, m_period, PRICE_CLOSE, MODE_MAIN, 1)` — the same closed bar, same tick. The value is static within a tick, so the conjunction `(X < threshold) AND (X >= threshold)` is algebraically impossible.
+
+### Triple Failure Impact
+
+| # | Failure | Consequence |
+|---|---|---|
+| F1 | TRANSITION edge **never fires** | Users with `InpEnableChopHedge=true` + `TRANSITION`: hedge **never opens** (silent failure, no error/log) |
+| F2 | `InpChopRearmBars` / `InpAdxHysteresis` **runtime-dead** | Only validated in `OnInit`; execution path never reads them — tuning is meaningless |
+| F3 | Panel `[EDGE!]` tag **never displays** | Display logic reused the same broken state machine |
+
+**Blast radius limited**: `InpEnableChopHedge=false` (default) + `InpEnableTrading=false` (default) means no user was affected unless they explicitly enabled both flags. The "default safe" design pattern provided containment.
+
+### Fix Applied (9 Edits)
+
+| # | Location | Change |
+|---|---|---|
+| 1 | `#property version` | `10.16` → `10.16.1` |
+| 2 | File header comment | Added v10.16.1 bug description |
+| 3 | `CAdxFilter` class | **Deleted** `m_prev_directional`, `m_regime_initialized` members |
+| 4 | `CAdxFilter::Init()` | Removed dead member initialization |
+| 5 | `CAdxFilter` methods | **Deleted** `JustBecameChoppy()`, `UpdateRegime()`, `WasDirectional()`, `IsRegimeInitialized()` |
+| 6 | **`ManageChopHedge()`** | TRANSITION: `JustBecameChoppy()` → **`ChopTransitionTriggered(InpChopRearmBars)`** (core fix) |
+| 7 | `UpdateComment()` | `[EDGE!]` tag now uses `ChopTransitionTriggered()` (single source of truth) |
+| 8 | Panel version string | `v10.16` → `v10.16.1` |
+| 9 | `OnTickHandler()` | **Deleted** `m_adx.UpdateRegime()` call |
+
+### Fix Semantics (Matches Original Requirement)
+
+```
+// ManageChopHedge() TRANSITION branch (v10.16.1):
+shouldFire = m_adx.ChopTransitionTriggered(InpChopRearmBars);
+// = ADX[1] < threshold − hysteresis
+//   AND ADX[2..1+rearmBars] >= threshold + hysteresis
+// Default (thr=20, rearm=1, hyst=0): ADX[2] >= 20 AND ADX[1] < 20
+```
+
+This is the **stateless closed-bar predicate** — it reads ADX from *different* bars (shift 1 vs shift 2+), making the cross-bar comparison meaningful. No state machine, no latch-then-judge, no timing dependency.
+
+### Correctness Truth Table (default rearm=1, hyst=0, thr=20)
+
+| Scenario | ADX[2] | ADX[1] | Fires? | Correct? |
+|---|---|---|---|---|
+| Trend continuation | 25 | 24 | false | ✅ |
+| **Trend→Chop crossing** | **24** | **18** | **true** | ✅ (core req) |
+| Chop continuation | 18 | 17 | false (ADX[2]<20) | ✅ (no piling) |
+| Chop→Trend (breakout) | 17 | 26 | false | ✅ |
+| Re-armed after trend | 22 | 19 | true | ✅ (re-arm) |
+| Threshold wobble 19→21→18 | 21 | 18 | true (once) | ✅ |
+| ADX not ready | 0 | 18 | false (fail-closed) | ✅ |
+
+### v10.16.1 SWOT Analysis
+
+#### Strengths (6)
+
+| # | Strength |
+|---|---|
+| S1 | Single branch swap fixes F1/F2/F3 simultaneously — high fix convergence |
+| S2 | Stateless predicate: restart-safe, no state loss, no CStateStore changes needed |
+| S3 | `InpChopRearmBars` + `InpAdxHysteresis` become effective runtime knobs (were dead) |
+| S4 | Deleting state machine eliminates "latch-then-judge ordering" coupling class entirely |
+| S5 | Single predicate serves both execution and display — no behavior/display divergence |
+| S6 | Default params yield exact PLAN spec: `ADX[2]>=20 && ADX[1]<20` |
+
+#### Weaknesses (4)
+
+| # | Weakness |
+|---|---|
+| W1 | Cannot compile in sandbox — syntax guarantee relies on static checks + manual MetaEditor |
+| W2 | Each new bar: 1+rearmBars iADX calls (default 2); negligible overhead but present |
+| W3 | Fix activates a feature that was silently broken — first real exposure in live market |
+| W4 | `IsChoppy()` (display, no hysteresis) vs `ChopTransitionTriggered()` (with hysteresis): slight definition split when hyst>0 |
+
+#### Opportunities (3)
+
+| # | Opportunity |
+|---|---|
+| O1 | Defect proof-of-concept (0 fires old vs N fires new) directly becomes CI regression test |
+| O2 | `InpAdxHysteresis` now usable for parameter robustness sweeps in Strategy Tester |
+| O3 | Stateless predicate is trivially unit-testable via mock iADX sequences |
+
+#### Threats (3)
+
+| # | Threat |
+|---|---|
+| T1 | ADX lag unchanged: transition may fire right before breakout — VSL/equity/leg caps must stay |
+| T2 | Users with `InpEnableChopHedge=true` who relied on "never fires" behavior will see hedging activate on upgrade |
+| T3 | FIFO/prop-firm incompatibility persists (mitigated by default-OFF, not eliminated) |
+
+### Post-Fix Verification
+
+| Check | Expected | Result |
+|---|---|---|
+| Version string | `10.16.1` | ✅ |
+| Lines | ~2,014 | ✅ (2,014) |
+| Classes | 15 | ✅ |
+| Inputs | 64 | ✅ |
+| `JustBecameChoppy` executable refs | 0 | ✅ |
+| `UpdateRegime` method | deleted | ✅ |
+| `WasDirectional` method | deleted | ✅ |
+| `m_prev_directional` member | deleted | ✅ |
+| `m_regime_initialized` member | deleted | ✅ |
+| `ChopTransitionTriggered` method | 1 def | ✅ |
+| `ChopTransitionTriggered` calls | ManageChopHedge + UpdateComment | ✅ |
+| `InpChopRearmBars` in execution path | present | ✅ |
+| Panel shows `v10.16.1` | yes | ✅ |
+| STATE mode untouched | `IsChoppy()` unchanged | ✅ |
+
+### Review Verdict
+
+✅ **Fix is necessary and sufficient.** Necessary: the v10.16 TRANSITION mode literally never executed (algebraic impossibility). Sufficient: single-point replacement restores all spec semantics and activates two dead parameters. Deleting the state machine (not patching call order) is the superior fix — it eliminates the entire class of "timing-coupled latch" bugs.
+
+---
+
+*OneMinuteMan v10.16.1. Critical bug fix: TRANSITION chop-hedge trigger was always-false due to same-tick ADX read in state machine. Replaced with stateless closed-bar predicate ChopTransitionTriggered(). Deleted broken state machine. InpChopRearmBars and InpAdxHysteresis now runtime-effective. Pending: MetaEditor compile, Strategy Tester log confirmation.*
+
