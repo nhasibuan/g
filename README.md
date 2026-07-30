@@ -4,9 +4,9 @@
 
 ## Overview
 
-**OneMinuteMan (OMM)** is a single-file, component-based MQL4 Expert Advisor at **version 10.16.1**, designed for M1 (1-minute) timeframe scalping. Built by [Norman Hasibuan](https://github.com/nhasibuan) with AI-assisted development, it combines candlestick pattern recognition, a ZigZag-based Pips-Per-Minute (PPM) momentum engine, an **ADX regime filter** (with stateless transition-based chop-hedging), ATR-dynamic risk management, virtual stop-losses, an event-driven loss-reversal system, and a **rolling win-rate performance tracker**.
+**OneMinuteMan (OMM)** is a single-file, component-based MQL4 Expert Advisor at **version 10.16.2**, designed for M1 (1-minute) timeframe scalping. Built by [Norman Hasibuan](https://github.com/nhasibuan) with AI-assisted development, it combines candlestick pattern recognition, a ZigZag-based Pips-Per-Minute (PPM) momentum engine, an **ADX regime filter** (with stateless transition-based chop-hedging), ATR-dynamic risk management, virtual stop-losses, an event-driven loss-reversal system, and a **rolling win-rate performance tracker**.
 
-**v10.16.1 fixes a critical bug**: the v10.16 TRANSITION mode chop-hedge trigger was **always false** due to a same-tick ADX read in the state machine (`UpdateRegime` + `JustBecameChoppy` both read `iADX(shift=1)`, making `(X<thr AND X>=thr)` logically impossible). The fix replaces the broken stateful approach with the **stateless closed-bar predicate** `ChopTransitionTriggered()`, which compares ADX[1] vs ADX[2..N] across different bars. The broken state machine has been deleted. `InpChopRearmBars` and `InpAdxHysteresis` are now runtime-effective (were dead inputs in v10.16).
+**v10.16.2 CLEAN CODE UPDATE:** Enhanced input validation (`InpMaxHedgeLegs` range check), defensive null-checks in `ChopTransitionTriggered()`, improved documentation for `ManageBreakoutExit()` implicit coupling, updated version strings throughout. Builds on v10.16.1 critical bug fix: the v10.16 TRANSITION mode chop-hedge trigger was **always false** due to a same-tick ADX read in the state machine (`UpdateRegime` + `JustBecameChoppy` both read `iADX(shift=1)`, making `(X<thr AND X>=thr)` logically impossible). The fix replaces the broken stateful approach with the **stateless closed-bar predicate** `ChopTransitionTriggered()`, which compares ADX[1] vs ADX[2..N] across different bars. The broken state machine has been deleted. `InpChopRearmBars` and `InpAdxHysteresis` are now runtime-effective (were dead inputs in v10.16).
 
 The EA forcibly operates on M1 candle data regardless of the chart timeframe, enabling focused 1-minute scalping strategy with comprehensive protection.
 
@@ -16,7 +16,7 @@ The EA forcibly operates on M1 candle data regardless of the chart timeframe, en
 
 **OneMinuteMan** is a MetaTrader 4 Expert Advisor (EA) written in MQL4, designed for M1 (1‑minute) scalping with **fixed linear risk** and comprehensive risk mitigations. It's a single `.mq4` file, internally organized into **15 single‑responsibility classes** behind a `CExpertAdvisor` facade.
 
-**v10.16.1:** Critical fix — TRANSITION chop-hedge trigger was always-false in v10.16 (state machine bug). Now uses stateless `ChopTransitionTriggered()` predicate. `InpChopRearmBars` and `InpAdxHysteresis` activated. Breakout exit closes hedge legs when ADX returns to directional.
+**v10.16.2:** Clean code enhancements — Input validation for `InpMaxHedgeLegs` (range 1-5), defensive null-checks in `ChopTransitionTriggered()`, enhanced documentation for `ManageBreakoutExit()` implicit coupling. Critical fix from v10.16.1 retained — TRANSITION chop-hedge trigger was always-false in v10.16 (state machine bug). Now uses stateless `ChopTransitionTriggered()` predicate. `InpChopRearmBars` and `InpAdxHysteresis` activated. Breakout exit closes hedge legs when ADX returns to directional.
 
 ---
 
@@ -47,7 +47,7 @@ The EA is structured as a **single-file component architecture** using classic O
 - **`CCandleEngine`** — Classifies 11 candlestick types (Hammer, Marubozu, 3 Doji variants, Long/Short, Spinning Top, Inverted Hammer) and derives trend direction vs SMA
 - **`CPpmEngine`** — Uses ZigZag indicator to compute pips-per-minute efficiency; classifies zones as LOW / MEDIUM / HIGH
 - **`CVolumeFilter`** — Tick-volume spike gate; blocks entries when volume is below threshold to ensure liquidity confirmation
-- **`CAdxFilter`** _(v10.14/v10.15/v10.16.1)_ — ADX trend-strength regime filter: blocks fresh entries in choppy markets (v10.14), optionally opens mean-reversion range-fade positions in chop via `InpEnableChopHedge` (v10.15), and supports a stateless transition trigger `ChopTransitionTriggered()` that fires only on trend→chop crossing (v10.16.1 fix)
+- **`CAdxFilter`** _(v10.14/v10.15/v10.16.2)_ — ADX trend-strength regime filter: blocks fresh entries in choppy markets (v10.14), optionally opens mean-reversion range-fade positions in chop via `InpEnableChopHedge` (v10.15), supports a stateless transition trigger `ChopTransitionTriggered()` that fires only on trend→chop crossing (v10.16.1 fix), enhanced with defensive null-checks and explicit EMPTY_VALUE handling (v10.16.2)
 
 #### Session, Risk & Performance
 - **`CSessionClock`** — Timezone-aware session window; daily halt flag persists across restarts
@@ -396,11 +396,11 @@ See PLAN.md v10.16.1 section for full root cause analysis, truth table, and SWOT
 
 - **Repository**: [nhasibuan/g](https://github.com/nhasibuan/g)
 - **Author**: [Norman Hasibuan (@nhasibuan)](https://github.com/nhasibuan)
-- **Latest Version**: v10.16.1 (July 30, 2026) — **critical bug fix**: TRANSITION chop-hedge trigger was always-false in v10.16; replaced with stateless `ChopTransitionTriggered()`
+- **Latest Version**: v10.16.2 (July 30, 2026) — **clean code enhancements**: Input validation (`InpMaxHedgeLegs` range 1-5), defensive null-checks in `ChopTransitionTriggered()`, enhanced `ManageBreakoutExit()` documentation. Includes v10.16.1 critical bug fix: TRANSITION chop-hedge trigger was always-false in v10.16; replaced with stateless `ChopTransitionTriggered()`
 - **License**: [MIT](LICENSE)
 - **Contributing**: [CONTRIBUTING.md](CONTRIBUTING.md)
 - **For Issues/Questions**: Refer to repository documentation and risk warnings
 
 ---
 
-*OneMinuteMan v10.16.1 is a disciplined, signal-only M1 scalper. Fixed risk per trade. No martingale. No compounding. 64 configurable inputs. 15 SRP classes. 12 serial entry guards. Stateless chop-hedge trigger (TRANSITION default, STATE available). InpChopRearmBars + InpAdxHysteresis now runtime-effective. Breakout exit closes hedge legs on regime change. Demo thoroughly and trade responsibly.*
+*OneMinuteMan v10.16.2 is a disciplined, signal-only M1 scalper with clean code enhancements. Fixed risk per trade. No martingale. No compounding. 65 configurable inputs (including validated `InpMaxHedgeLegs` range). 15 SRP classes. 12 serial entry guards. Stateless chop-hedge trigger (TRANSITION default, STATE available) with defensive null-checks. `InpChopRearmBars` + `InpAdxHysteresis` runtime-effective. Breakout exit closes hedge legs on regime change. Enhanced documentation for maintainability. Demo thoroughly and trade responsibly.*
