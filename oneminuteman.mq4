@@ -5,14 +5,10 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, nhasibuan"
 #property link      "https://github.com/nhasibuan/g"
-#property version   "10.16.1"
+#property version   "10.16.2"
 #property strict
-#property description "OneMinuteMan v10.16.1: Signal-only M1 scalper with event-driven loss-reversal and transition-based chop-hedging."
-// v10.16.1 BUG FIX: JustBecameChoppy() was always-false because UpdateRegime()
-// and JustBecameChoppy() both read iADX(shift=1) on the same tick, making the
-// condition (ADX<thr AND ADX>=thr) a logical impossibility. TRANSITION mode
-// silently never fired. Fixed by replacing the stateful state machine with the
-// stateless ChopTransitionTriggered() which compares ADX[1] vs ADX[2..N].
+#property description "OneMinuteMan v10.16.2: Signal-only M1 scalper with event-driven loss-reversal and transition-based chop-hedging."
+#property description "CLEAN CODE v10.16.2: Enhanced input validation, defensive null-checks, improved documentation."
 #property description "No martingale. Fixed linear risk. FIFO/netting compatible by default (chop-hedge breaks FIFO when enabled)."
 #property description "ATR-dynamic risk, virtual SL with safety net, break-even, persistent equity guards."
 
@@ -207,7 +203,7 @@ input int    InpReversalArmTimeoutSec = 300; // 0=off; auto-disarm reversal if u
 input bool               InpEnableChopHedge  = false;               // Enable chop-hedging (FIFO-BREAKING; default OFF)
 input ENUM_CHOP_TRIGGER  InpChopHedgeTrigger = CHOP_TRIGGER_TRANSITION; // Trigger: STATE (every chop bar) or TRANSITION (trend->chop edge only)
 input double             InpHedgeLots        = 0.0;                 // 0.0 = use InpBaseLots for hedge legs
-input int                InpMaxHedgeLegs     = 2;                   // Max concurrent chop-hedge legs (hard exposure cap)
+input int                InpMaxHedgeLegs     = 2;                   // Max concurrent chop-hedge legs (hard exposure cap). Range: 1-5.
 input bool               InpBreakoutExit     = true;                // Close hedge legs on breakout (ADX returns to directional)
 
 //==================================================================
@@ -699,6 +695,7 @@ public:
    // Structurally guarantees single-fire: the transition pair (bar_N-1, bar_N)
    // occupies shifts (2,1) only on bar_N+1's opening tick; next bar it ages
    // out of window. No state machine needed.
+   // BF2 (v10.16.2): Enhanced null-checking for defensive programming.
    bool ChopTransitionTriggered(int rearmBars=1) {
       if(!m_enabled) return false;
       int bars = (rearmBars > 1) ? rearmBars : 1;
@@ -706,12 +703,14 @@ public:
       double trendEnter = m_threshold + m_hysteresis;
       if(chopEnter < 0.0) chopEnter = 0.0;
 
+      // BF2: Defensive null-check for current bar ADX
       double adxNow = ValueAt(1);
-      if(adxNow <= 0.0 || adxNow >= chopEnter) return false;
+      if(adxNow <= 0.0 || adxNow == EMPTY_VALUE || adxNow >= chopEnter) return false;
 
+      // BF2: Defensive null-check for prior bars ADX values
       for(int barShift=2; barShift<2+bars; barShift++) {
          double adxPrev = ValueAt(barShift);
-         if(adxPrev <= 0.0 || adxPrev < trendEnter) return false;
+         if(adxPrev <= 0.0 || adxPrev == EMPTY_VALUE || adxPrev < trendEnter) return false;
       }
       return true;
    }
@@ -1708,12 +1707,18 @@ private:
    // positions to prevent a trending move from hitting stale range-fade legs.
    // Only active when InpEnableChopHedge=true AND InpBreakoutExit=true.
    // Fires on every tick (not just new bar) for rapid response.
+   // BF3 (v10.16.2): Enhanced documentation clarifying implicit coupling.
+   // NOTE: This method implicitly assumes ALL open positions are hedge legs.
+   // If used in future with mixed position types, refactor to filter by ticket/magic.
    void ManageBreakoutExit() {
       if(!InpEnableChopHedge || !InpBreakoutExit) return;
       if(m_exec.CountPositions() == 0)             return; // nothing to close
       if(!m_adx.IsDirectional())                   return; // still choppy; hold legs
 
       // ADX is now directional while hedge legs are open -> breakout detected
+      // BF3: Explicitly document that CloseAll() closes ALL positions (hedge + signal legs)
+      // Current design: chop-hedge only fires when CountPositions()==0 or partial leg closure
+      // Future enhancement: add ticket-based filtering if mixed position types are introduced
       Print("BreakoutExit: ADX[1]=", DoubleToString(m_adx.ValueAt(1), 1),
             " ADX[2]=", DoubleToString(m_adx.ValueAt(2), 1),
             " >= threshold ", DoubleToString(InpAdxThreshold, 1),
@@ -1727,7 +1732,7 @@ private:
       if(now == m_last_comment_time) return; // skip if already updated this second
       m_last_comment_time = now;
 
-      string msg = "=== OneMinuteMan v10.16.1 (no-mart) ===\n";
+      string msg = "=== OneMinuteMan v10.16.2 (no-mart, clean code) ===\n";
       msg += StringFormat("Symbol:%-6s  Engine:%s\n", Symbol(), TFLabel());
       msg += "--- Range ---\n";
       msg += StringFormat("High:%.5f  Low:%.5f  Range:%.5f\n",
@@ -1847,6 +1852,12 @@ public:
          Print("  Only enable on brokers explicitly permitting long+short hedging.");
       }
 
+      // --- input validation (BF1: validate InpMaxHedgeLegs) ---
+      if(InpMaxHedgeLegs < 1 || InpMaxHedgeLegs > 5) {
+         Print("ERROR: InpMaxHedgeLegs must be between 1 and 5. Current value: ", InpMaxHedgeLegs);
+         return INIT_FAILED;
+      }
+
       // --- component initialization ---
       m_spread.Init(InpSprEmaAlpha, InpMaxSpreadMult, InpSlippageMult,
                     InpSlippage, InpMaxSpread);
@@ -1922,12 +1933,13 @@ public:
          { Print("Error: Timer failed"); return INIT_FAILED; }
 
       m_initialized = true;
-      Print("OneMinuteMan v10.16 initialized. ADX:", InpUseAdxFilter?"ON":"OFF",
+      Print("OneMinuteMan v10.16.2 initialized. ADX:", InpUseAdxFilter?"ON":"OFF",
             " ChopHedge:", InpEnableChopHedge?"ON (FIFO-BREAKING)":"OFF",
             " Trigger:", (InpChopHedgeTrigger==CHOP_TRIGGER_TRANSITION)?"TRANSITION":"STATE",
             " BreakoutExit:", InpBreakoutExit?"ON":"OFF",
             " WinRateHalt:", InpUseWinRateHalt?"ON":"OFF",
-            " ReversalTimeout:", InpReversalArmTimeoutSec, "s");
+            " ReversalTimeout:", InpReversalArmTimeoutSec, "s",
+            " MaxHedgeLegs:", InpMaxHedgeLegs);
       return INIT_SUCCEEDED;
    }
 
