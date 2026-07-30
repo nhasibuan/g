@@ -5,10 +5,10 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, nhasibuan"
 #property link      "https://github.com/nhasibuan/g"
-#property version   "10.16.2"
+#property version   "10.17"
 #property strict
-#property description "OneMinuteMan v10.16.2: Signal-only M1 scalper with event-driven loss-reversal and transition-based chop-hedging."
-#property description "CLEAN CODE v10.16.2: Enhanced input validation, defensive null-checks, improved documentation."
+#property description "OneMinuteMan v10.17: Signal-only M1 scalper with event-driven loss-reversal and transition-based chop-hedging."
+#property description "v10.17: B2 equity-guard bypass fix (CRITICAL), B3 timer breakout exit, B4 breakout confirm bars, B5 input validation."
 #property description "No martingale. Fixed linear risk. FIFO/netting compatible by default (chop-hedge breaks FIFO when enabled)."
 #property description "ATR-dynamic risk, virtual SL with safety net, break-even, persistent equity guards."
 
@@ -205,6 +205,7 @@ input ENUM_CHOP_TRIGGER  InpChopHedgeTrigger = CHOP_TRIGGER_TRANSITION; // Trigg
 input double             InpHedgeLots        = 0.0;                 // 0.0 = use InpBaseLots for hedge legs
 input int                InpMaxHedgeLegs     = 2;                   // Max concurrent chop-hedge legs (hard exposure cap). Range: 1-5.
 input bool               InpBreakoutExit     = true;                // Close hedge legs on breakout (ADX returns to directional)
+input int                InpBreakoutConfirmBars = 1;                // v10.17 (B4): Consecutive directional bars before breakout exit (1=legacy, 2-3=less sensitive)
 
 //==================================================================
 // SECTION 2 -- CONSTANTS, STRUCTURES & UTILITIES
@@ -1286,7 +1287,8 @@ private:
 
 //==================================================================
 // v10.13: Martingale fields removed. Loss-reversal state added.
-// Format: OMM5 (0x4F4D4D35). Old OMM4 files safely discarded.
+// v10.14: Bumped to OMM6 (0x4F4D4D36) -- adds CPerformanceTracker ring buffer.
+// Old OMM4 (v10.12) and OMM5 (v10.13) files safely discarded.
 // FIX-4: the halt flag, halt-until time, day baseline and day stamp are
 // now persisted, so a terminal restart can no longer bypass the daily
 // drawdown halt or re-anchor the baseline.
@@ -1539,6 +1541,12 @@ private:
       if(!InpEnableLossReversal || !InpEnableTrading) return;
       if(!m_reversal_pending)                         return;
 
+      // BF4 (v10.17 B2): Equity-guard check MUST precede any new position open.
+      // Closes a latent bypass where m_vsl.Enforce() closes a position on the timer,
+      // ManageReverseEntry runs immediately after without re-checking the guard,
+      // and opens a reversal on an account the EA should have halted.
+      if(!EquityGuardOK()) return;
+
       // v10.14: Auto-disarm if reversal was armed but never fired within timeout
       if(InpReversalArmTimeoutSec > 0 &&
          TimeCurrent() - m_last_loss_close_time > InpReversalArmTimeoutSec) {
@@ -1713,16 +1721,23 @@ private:
    void ManageBreakoutExit() {
       if(!InpEnableChopHedge || !InpBreakoutExit) return;
       if(m_exec.CountPositions() == 0)             return; // nothing to close
-      if(!m_adx.IsDirectional())                   return; // still choppy; hold legs
 
-      // ADX is now directional while hedge legs are open -> breakout detected
-      // BF3: Explicitly document that CloseAll() closes ALL positions (hedge + signal legs)
-      // Current design: chop-hedge only fires when CountPositions()==0 or partial leg closure
-      // Future enhancement: add ticket-based filtering if mixed position types are introduced
-      Print("BreakoutExit: ADX[1]=", DoubleToString(m_adx.ValueAt(1), 1),
+      // v10.17 (B4): Confirmation window — require InpBreakoutConfirmBars consecutive
+      // directional bars before closing hedge legs. Default 1 preserves v10.16.2
+      // behavior; values 2-3 reduce false-breakout closure in choppy-then-spike markets.
+      int confirmBars = (InpBreakoutConfirmBars > 0) ? InpBreakoutConfirmBars : 1;
+      for(int shift = 1; shift <= confirmBars; shift++) {
+         double adx = m_adx.ValueAt(shift);
+         if(adx <= 0.0 || adx < InpAdxThreshold) return; // not all confirm bars directional
+      }
+
+      // All confirmation bars are directional — true breakout detected
+      // BF3: CloseAll() closes ALL positions (hedge + signal legs) — implicit coupling.
+      // Safe today because chop-hedge only fires when CountPositions()==0 or partial.
+      Print("BreakoutExit (confirmed ", confirmBars, " bars): ADX[1]=", DoubleToString(m_adx.ValueAt(1), 1),
             " ADX[2]=", DoubleToString(m_adx.ValueAt(2), 1),
             " >= threshold ", DoubleToString(InpAdxThreshold, 1),
-            ". Closing ", m_exec.CountPositions(), " hedge legs.");
+            " for ", confirmBars, " bars. Closing ", m_exec.CountPositions(), " hedge legs.");
       m_exec.CloseAll(m_spread.EffSlippage(), m_vsl);
    }
 
@@ -1732,7 +1747,7 @@ private:
       if(now == m_last_comment_time) return; // skip if already updated this second
       m_last_comment_time = now;
 
-      string msg = "=== OneMinuteMan v10.16.2 (no-mart, clean code) ===\n";
+      string msg = "=== OneMinuteMan v10.17 (no-mart) ===\n";
       msg += StringFormat("Symbol:%-6s  Engine:%s\n", Symbol(), TFLabel());
       msg += "--- Range ---\n";
       msg += StringFormat("High:%.5f  Low:%.5f  Range:%.5f\n",
@@ -1842,6 +1857,26 @@ public:
          { Print("Error: InpChopRearmBars must be >= 1"); return INIT_PARAMETERS_INCORRECT; }
       if(InpAdxHysteresis < 0.0)
          { Print("Error: InpAdxHysteresis must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
+      // v10.17 (B4): Breakout confirmation bars validation
+      if(InpBreakoutConfirmBars < 1)
+         { Print("Error: InpBreakoutConfirmBars must be >= 1"); return INIT_PARAMETERS_INCORRECT; }
+      // v10.17 (B5): Additional input validation — close gaps identified in audit
+      if(InpAtrPeriod < 1)
+         { Print("Error: InpAtrPeriod must be >= 1"); return INIT_PARAMETERS_INCORRECT; }
+      if(InpAdxPeriod < 1)
+         { Print("Error: InpAdxPeriod must be >= 1"); return INIT_PARAMETERS_INCORRECT; }
+      if(InpAverPeriod < 1)
+         { Print("Error: InpAverPeriod must be >= 1"); return INIT_PARAMETERS_INCORRECT; }
+      if(InpVolLookback < 1)
+         { Print("Error: InpVolLookback must be >= 1"); return INIT_PARAMETERS_INCORRECT; }
+      if(InpAtrSLMult <= 0)
+         { Print("Error: InpAtrSLMult must be > 0"); return INIT_PARAMETERS_INCORRECT; }
+      if(InpAtrTPMult <= 0)
+         { Print("Error: InpAtrTPMult must be > 0"); return INIT_PARAMETERS_INCORRECT; }
+      if(InpMinEquity < 0)
+         { Print("Error: InpMinEquity must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
+      if(InpMaxDrawdownPct < 0)
+         { Print("Error: InpMaxDrawdownPct must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
       if(InpEnableChopHedge && !InpUseAdxFilter)
          { Print("Error: InpEnableChopHedge requires InpUseAdxFilter=true (ADX data needed for choppiness detection)"); return INIT_PARAMETERS_INCORRECT; }
       // v10.15: FIFO-compatibility warning when chop-hedge is enabled
@@ -1973,6 +2008,7 @@ public:
       m_trailing.Manage(m_risk, m_vsl, InpMagic);
       m_vsl.Enforce(m_spread.EffSlippage());
       ManageReverseEntry();
+      ManageBreakoutExit();  // v10.17 (B3): wired in timer for low-tick environments
       UpdateComment();
    }
 

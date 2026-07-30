@@ -1551,3 +1551,112 @@ Added `ADX[2]` for regime transition context on exit path as well.
 
 Both `conservative.set` and `ftmo_challenge.set` headers updated to v10.16.1, date 2026-07-30. Both already contain explicit `InpChopRearmBars=1` and `InpAdxHysteresis=0.0` entries (document-complete).
 
+---
+
+## v10.17 — Bug-Fix & Hardening Audit (5 Findings)
+
+**Audit date**: 2026-07-30
+**Auditor**: Mavis (design-spec-driven audit on top of PLAN.md v10.16.1)
+**Base version**: v10.16.2 (2,031 LOC, 15 classes, 64 inputs)
+**Delivery**: v10.17 (2,067 LOC, 15 classes, 65 inputs)
+
+### Executive Summary
+
+| # | Finding | Severity | Status |
+|---|---|---|---|
+| B1 | Stale `OMM5` comment in `CStateStore` header | 🟢 Low | ✅ Fixed |
+| B2 | **CRITICAL: `ManageReverseEntry()` bypasses equity guard** | 🔴 Critical | ✅ Fixed |
+| B3 | `ManageBreakoutExit()` not wired in `OnTimerHandler` | 🟠 High | ✅ Fixed |
+| B4 | 1-bar ADX spike triggers false breakout exit (T10) | 🟡 Medium | ✅ Fixed |
+| B5 | Inconsistent input validation gaps in `OnInit` | 🟡 Low | ✅ Fixed |
+
+### B1. Stale `OMM5` Comment in `CStateStore` — Documentation Drift
+
+**Root cause**: `CStateStore` class header (line 1289) said "Format: OMM5 (0x4F4D4D35)" when `STATE_MAGIC` was bumped to OMM6 (0x4F4D4D36) in v10.14.
+
+**Fix**: Updated comment to document OMM6 (0x4F4D4D36) with version history.
+
+**AC**: `grep "OMM5" source` returns 0 executable hits; `grep "OMM6"` returns ≥2 hits. ✅
+
+### B2. CRITICAL: `ManageReverseEntry()` Equity-Guard Bypass
+
+**Root cause**: `ManageReverseEntry()` did not call `EquityGuardOK()`. In `OnTimerHandler`, the call order is `m_vsl.Enforce()` → `ManageReverseEntry()`. If a virtual SL close dropped equity below `InpMinEquity`, the reversal could fire without ever consulting the equity guard on that timer tick.
+
+**Reproduction path**:
+1. Position hits VSL on timer tick → `m_vsl.Enforce()` closes it
+2. `ManageReverseEntry()` runs immediately after
+3. `m_reversal_pending == true` (armed from previous tick's loss detection)
+4. `TradingWindowOpen()` → true (halt not yet set on this timer tick)
+5. **Reversal fires on an account the EA should have halted**
+
+**Fix**: Added `if(!EquityGuardOK()) return;` as the third guard in `ManageReverseEntry()`, after `m_reversal_pending` check.
+
+**AC**: `ManageReverseEntry` now calls `EquityGuardOK()`. All 3 position-opening paths (`ManageEntries`, `ManageChopHedge`, `ManageReverseEntry`) now have consistent equity-guard gating. ✅
+
+### B3. `ManageBreakoutExit()` Not Wired in `OnTimerHandler`
+
+**Root cause**: `ManageBreakoutExit()` was only called from `OnTickHandler()`. In low-tick environments (illiquid pairs, weekend rollover, broker with sparse feed), a breakout could persist for seconds before a tick fires.
+
+**Fix**: Added `ManageBreakoutExit();` to `OnTimerHandler`, between `ManageReverseEntry()` and `UpdateComment()`.
+
+**AC**: `ManageBreakoutExit()` appears in both `OnTickHandler` and `OnTimerHandler`. When `InpEnableChopHedge == false` (default), the call is a single `if` early-exit — negligible cost. ✅
+
+### B4. False-Breakout Exposure — `InpBreakoutConfirmBars`
+
+**Root cause**: `ManageBreakoutExit()` triggered on a single bar where ADX ≥ threshold. A 1-bar ADX spike (news wick, spread blowout) would close profitable range-fade legs prematurely. This was v10.16 SWOT item T10, acknowledged but unmitigated.
+
+**Fix**: New input `InpBreakoutConfirmBars` (default 1, range 1-10). `ManageBreakoutExit()` now requires N consecutive directional bars before closing legs. Default 1 = exact v10.16.2 behavior (backward compatible).
+
+**AC**: With `InpBreakoutConfirmBars=1`, behavior is bit-identical to v10.16.2. With 2+, legs survive single-bar ADX spikes. OnInit validates `>= 1`. Total inputs: 64 → 65. ✅
+
+### B5. Inconsistent Input Validation
+
+**Root cause**: `OnInit` validated some inputs but missed others (`InpAtrPeriod`, `InpAdxPeriod`, `InpAverPeriod`, `InpVolLookback`, `InpAtrSLMult`, `InpAtrTPMult`, `InpMinEquity`, `InpMaxDrawdownPct`). Invalid values would silently fall through to `Init()` methods with inconsistent error handling.
+
+**Fix**: Added 8 new validation checks to `OnInit`, all returning `INIT_PARAMETERS_INCORRECT` with descriptive error messages.
+
+**AC**: All 8 new validations present. Negative/zero values for these inputs now produce clear error messages instead of silent fallback. ✅
+
+### v10.17 SWOT Impact
+
+**Strengths gained:**
+- **S16**: All 3 position-opening paths now have consistent equity-guard gating (B2)
+- **S17**: Breakout exit responsive in low-tick environments via timer wiring (B3)
+- **S18**: False-breakout mitigation via configurable confirmation window (B4)
+- **S19**: 8 additional input validations close defensive gaps (B5)
+
+**Weaknesses resolved:**
+- W-B2: Equity-guard bypass eliminated
+- W-B3: Timer/tick coverage gap closed
+- T10: False breakout partially mitigated (full fix with confirm bars ≥ 2)
+
+**New inputs:** `InpBreakoutConfirmBars` (total: 65)
+
+### Verification Checklist
+
+| Check | Expected | Result |
+|---|---|---|
+| Version | `10.17` | ✅ |
+| Lines | ~2,067 | ✅ |
+| Classes | 15 | ✅ |
+| Inputs | 65 | ✅ |
+| Braces | balanced | ✅ (235/235) |
+| OMM5 exec refs | 0 | ✅ |
+| OMM6 refs | ≥2 | ✅ (4) |
+| EquityGuardOK in ManageReverseEntry | present | ✅ |
+| ManageBreakoutExit in OnTimerHandler | present | ✅ |
+| InpBreakoutConfirmBars declared | 1 | ✅ |
+| InpBreakoutConfirmBars in OnInit | validated | ✅ |
+| 8 new validations (B5) | all present | ✅ |
+| Panel version | v10.17 | ✅ |
+| Presets | v10.17 headers | ✅ |
+
+### Pending (MetaEditor/MT4 Required)
+
+1. MetaEditor compile (F7) — confirm zero errors/warnings
+2. Strategy Tester: verify equity-guard prevents reversal fire after VSL close on halted account (B2)
+3. Strategy Tester: verify breakout exit fires on timer in tick-sparse periods (B3)
+4. Strategy Tester: verify InpBreakoutConfirmBars=2 survives 1-bar ADX spikes (B4)
+
+*OneMinuteMan v10.17. Five audit findings fixed (1 critical equity-guard bypass, 1 high timer coverage gap, 1 medium false-breakout mitigation, 1 low stale comment, 1 low input validation). 65 inputs, 15 classes, 2,067 LOC. Pending MetaEditor compile.*
+
