@@ -1691,7 +1691,11 @@ private:
          m_trades_today++;
          Print("ChopHedge fired: dir=", (hedgeDir > 0) ? "BUY" : "SELL",
                " lots=", DoubleToString(lots, 2),
-               " ADX=", DoubleToString(m_adx.Value(), 1),
+               " ADX[1]=", DoubleToString(m_adx.ValueAt(1), 1),
+               " ADX[2]=", DoubleToString(m_adx.ValueAt(2), 1),
+               " thr=", DoubleToString(InpAdxThreshold, 1),
+               " hyst=", DoubleToString(InpAdxHysteresis, 1),
+               " rearm=", InpChopRearmBars,
                " trigger=", (InpChopHedgeTrigger == CHOP_TRIGGER_TRANSITION) ? "TRANSITION" : "STATE",
                " mid=", DoubleToString(rangeMid, 5),
                " positions=", m_exec.CountPositions());
@@ -1710,7 +1714,8 @@ private:
       if(!m_adx.IsDirectional())                   return; // still choppy; hold legs
 
       // ADX is now directional while hedge legs are open -> breakout detected
-      Print("BreakoutExit: ADX=", DoubleToString(m_adx.Value(), 1),
+      Print("BreakoutExit: ADX[1]=", DoubleToString(m_adx.ValueAt(1), 1),
+            " ADX[2]=", DoubleToString(m_adx.ValueAt(2), 1),
             " >= threshold ", DoubleToString(InpAdxThreshold, 1),
             ". Closing ", m_exec.CountPositions(), " hedge legs.");
       m_exec.CloseAll(m_spread.EffSlippage(), m_vsl);

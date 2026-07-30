@@ -1515,3 +1515,39 @@ This is the **stateless closed-bar predicate** — it reads ADX from *different*
 
 *OneMinuteMan v10.16.1. Critical bug fix: TRANSITION chop-hedge trigger was always-false due to same-tick ADX read in state machine. Replaced with stateless closed-bar predicate ChopTransitionTriggered(). Deleted broken state machine. InpChopRearmBars and InpAdxHysteresis now runtime-effective. Pending: MetaEditor compile, Strategy Tester log confirmation.*
 
+### v10.16.1 Regime Transition Telemetry Enhancement (OT1/WT5)
+
+Addresses SWOT items OT1 (regime transition telemetry) and WT5 (audit trail for "why didn't it fire?").
+
+#### ChopHedge Fired Log (enhanced)
+
+Before (v10.16):
+```
+ChopHedge fired: dir=SELL lots=0.01 ADX=18.3 trigger=TRANSITION mid=1.09450 positions=1
+```
+
+After (v10.16.1):
+```
+ChopHedge fired: dir=SELL lots=0.01 ADX[1]=18.3 ADX[2]=24.1 thr=20.0 hyst=0.0 rearm=1 trigger=TRANSITION mid=1.09450 positions=1
+```
+
+Added fields: `ADX[1]` (current bar), `ADX[2]` (prior bar), `thr` (threshold), `hyst` (hysteresis band), `rearm` (rearm bars). Enables post-trade review of the exact transition pair that caused the hedge entry.
+
+#### BreakoutExit Log (enhanced)
+
+Before:
+```
+BreakoutExit: ADX=26.1 >= threshold 20.0. Closing 2 hedge legs.
+```
+
+After:
+```
+BreakoutExit: ADX[1]=26.1 ADX[2]=18.3 >= threshold 20.0. Closing 2 hedge legs.
+```
+
+Added `ADX[2]` for regime transition context on exit path as well.
+
+#### Preset Files Updated
+
+Both `conservative.set` and `ftmo_challenge.set` headers updated to v10.16.1, date 2026-07-30. Both already contain explicit `InpChopRearmBars=1` and `InpAdxHysteresis=0.0` entries (document-complete).
+
