@@ -107,7 +107,7 @@ The EA can optionally open a reverse-direction position **after a losing close**
 
 - **Adaptive Execution**: Spread/slippage derived from rolling EMA multipliers; symbol-agnostic (no hardcoded pair profiles)
 - **State Persistence**: Saves on every trade/halt/deinit; restores on init; survives restart, chart re-attach, VPS migration, and recompilation safely
-- **Versioned Format**: `CStateStore` uses magic tag `OMM5` (0x4F4D4D35) to safely discard incompatible state files from older versions (including OMM4 from v10.12)
+- **Versioned Format**: `CStateStore` uses magic tag `OMM6` (0x4F4D4D36) to safely discard incompatible state files from older versions (including OMM5 from v10.13 and OMM4 from v10.12)
 
 ### Conflict Resolution Policy (Timer vs. Tick)
 
@@ -130,11 +130,11 @@ The EA can optionally open a reverse-direction position **after a losing close**
 | **Daily trade cap** | Optional `InpMaxTradesPerDay` limits total trades per day | Prevents overtrading |
 | **Reverse loss cap** | `InpMaxReverseLossesPerDay` limits reverse-leg losses per day | Contains doubling risk |
 | **Reverse confirmation** | Candle/PPM signal confirmation gate for reverse entries | Filters low-quality reversals |
-| **State persistence** | Binary Memento with day-stamped baseline and halt flag (OMM5) | Crash-safe protection state |
+| **State persistence** | Binary Memento with day-stamped baseline and halt flag (OMM6) | Crash-safe protection state |
 
 ---
 
-## Comprehensive SWOT Analysis (v10.13)
+## Comprehensive SWOT Analysis (v10.18)
 
 ### Strengths (14 Items)
 
@@ -142,15 +142,15 @@ The EA can optionally open a reverse-direction position **after a losing close**
 |---|---|---|
 | **S1** | **Fixed linear risk per trade** | `InpBaseLots` is the only lot source; no compounding. Worst-case per-trade loss is enumerable. |
 | **S2** | **Hard-bounded daily drawdown** | `CEquityGuard` combines daily-DD% halt + absolute equity floor; persistent across restarts. |
-| **S3** | **Crash-safe state (OMM5)** | Versioned binary file with magic tag verification. Old OMM4 files safely discarded. |
+| **S3** | **Crash-safe state (OMM6)** | Versioned binary file with magic tag verification. Old OMM4/OMM5 files safely discarded. |
 | **S4** | **Two-layer stop loss** | Virtual SL + wide broker safety SL (5×) — two independent protection paths. |
 | **S5** | **Single-position invariant** | `CountPositions()` + emergency-flatten clause; structural, not procedural. |
 | **S6** | **Deterministic, no RNG** | No `MathRand` anywhere; backtests are 100% reproducible. |
-| **S7** | **8-AND conjunctive signal gate** | High specificity entry filter; low false-signal rate. |
+| **S7** | **12-AND conjunctive signal gate** | High specificity entry filter (12 serial guards, v10.14+); low false-signal rate. |
 | **S8** | **Session-aware timezone** | `CSessionClock` with explicit TZ offset avoids DST bugs. |
-| **S9** | **FIFO/netting compatible** | Reverse leg waits for flat account; zero concurrent hedging. |
+| **S9** | **FIFO/netting compatible by default** | Reverse leg waits for flat account; zero concurrent hedging unless opt-in chop-hedge is enabled. |
 | **S10** | **ATR-adaptive risk** | SL/TP/trail/BE scale with market volatility automatically. |
-| **S11** | **Clean SRP decomposition** | 13 classes, each with one named responsibility; easy to swap components. |
+| **S11** | **Clean SRP decomposition** | 15 classes, each with one named responsibility; easy to swap components. |
 | **S12** | **No DLL, no external lib** | Pure single-file MQL4; one file deployment. |
 | **S13** | **Reversal confirmation gate** | `ENUM_REVERSE_CONFIRM` filters reverse entries by candle/PPM signals. |
 | **S14** | **Daily limits on reversals** | `InpMaxReverseLossesPerDay` and `InpMaxTradesPerDay` bound worst-case exposure. |
@@ -162,12 +162,12 @@ The EA can optionally open a reverse-direction position **after a losing close**
 | **W1** | **Reverse leg can compound losses** | Consecutive both-leg losses (original + reverse) = 2× per-cycle drawdown. |
 | **W2** | **No recovery mechanism by design** | If signal win rate < 50% with R:R ≤ 1, expected value is negative. |
 | **W3** | **ZigZag repaint on incomplete bars** | `m_ppm_valid` flag mitigates but look-ahead bias risk exists in backtesting. |
-| **W4** | **Single-file MQL4 size ceiling** | ~1500 lines; future features may force refactor to `.mqh` includes. |
+| **W4** | **Single-file MQL4 size ceiling** | ~2,165 lines; future features may force refactor to `.mqh` includes. |
 | **W5** | **No backtest evidence shipped** | Signal quality unverified at release time; users must validate independently. |
 | **W6** | **No formal minimum win rate gate** | Plan does not specify what win rate must be achieved before deployment. |
 | **W7** | **Dual execution path (timer + tick)** | Explicit conflict-resolution policy added, but edge cases may exist. |
 | **W8** | **No `.set` file migration** | Users upgrading from v10.12 must reconfigure inputs manually. |
-| **W9** | **Unquantified conjunction frequency** | 8-AND filter may over-filter in low-volatility or under-filter in trending regimes. |
+| **W9** | **Unquantified conjunction frequency** | 12-AND filter may over-filter in low-volatility or under-filter in trending regimes. |
 | **W10** | **"Losing close" includes swap/commission** | Trades with positive price P&L but negative net P&L trigger reverse. |
 | **W11** | **Single maintainer** | Bus factor = 1; no external CI/CD or issue tracker. |
 | **W12** | **No multi-symbol coordination** | Each chart instance operates independently; shared risk across symbols not managed. |
@@ -181,11 +181,11 @@ The EA can optionally open a reverse-direction position **after a losing close**
 | **O3** | **A/B reverse-leg on/off testing** | High — `InpEnableLossReversal = false` provides clean baseline. |
 | **O4** | **Per-session parameter profiles** | Medium — ATR/PPM thresholds per session (London/NY). |
 | **O5** | **Mean-reversion capture** | Medium — Reverse-after-loss is a structural mean-reversion bet. |
-| **O6** | **Telemetry export (CSV/JSON trade log)** | Medium — Optional `FileWrite` per trade for analysis. |
+| **O6** | **Telemetry export (CSV/JSON trade log)** | Medium — `CPerformanceTracker` writes per-trade CSV; JSON export is a future item. |
 | **O7** | **MQL5 port** | Medium — Architecture is language-agnostic; doubles addressable market. |
 | **O8** | **Open-source credibility** | Medium — No martingale = trust signal for disciplined traders. |
-| **O9** | **ADX regime filter (permanent)** | High — Add non-martingale ADX filter to block entries in choppy markets. |
-| **O10** | **Configurable reverse delay as noise filter** | High — Post-loss delay skips initial volatility spike. |
+| **O9** | **ADX regime filter (permanent)** | High — Implemented as `CAdxFilter` since v10.14; default ON. |
+| **O10** | **Configurable reverse delay as noise filter** | High — `InpLossReversalDelaySec` already shipped (v10.13). |
 | **O11** | **Multi-symbol manager EA** | Medium — Component isolation supports multi-instance coordination. |
 
 ### Threats (9 Items)
@@ -195,7 +195,7 @@ The EA can optionally open a reverse-direction position **after a losing close**
 | **T1** | **Both-leg loss sequences** | High | `InpMaxReverseLossesPerDay` bounds daily reverse losses. |
 | **T2** | **Spread-spike on M1 during news** | High | `CSpreadMonitor` gates entry; add post-news grace period. |
 | **T3** | **Broker requotes / latency** | High | Adaptive slippage; add `InpMaxRequoteRetries` in future. |
-| **T4** | **Ranging/choppy markets** | High | Add permanent ADX regime filter (opportunity O9). |
+| **T4** | **Ranging/choppy markets** | High | Permanent `CAdxFilter` blocks entries in choppy markets (v10.14+). |
 | **T5** | **Regulatory / ToS restrictions** | Medium | `InpMinHoldSec` input supports broker minimum hold rules. |
 | **T6** | **ZigZag repaint contaminating signals** | Medium | Enforced on closed bars via `m_ppm_valid`. |
 | **T7** | **Overfitting to historical data** | Medium | Walk-forward validation required before live deployment. |
@@ -208,9 +208,9 @@ The EA can optionally open a reverse-direction position **after a losing close**
 
 ### Architecture & Code Quality
 
-- **Clean Component Boundary**: Facade + 13 SRP classes with explicit wiring; MT4 handlers only delegate; no global mutable state
-- **Well-Documented Flows**: Architecture comment block describes all components and their responsibilities
-- **Robustness**: Versioned state files (magic tag `OMM5` = 0x4F4D4D35), day-stamped drawdown baseline, retry on virtual SL close failures
+- **Clean Component Boundary**: Facade + 15 SRP classes with explicit wiring; MT4 handlers only delegate; no global mutable state
+- **Well-Documented Flows**: Architecture comment block describes all 15 components and their responsibilities
+- **Robustness**: Versioned state files (magic tag `OMM6` = 0x4F4D4D36), day-stamped drawdown baseline, retry on virtual SL close failures
 - **Performance Note**: `CRangeScanner::Rescan()` performs O(n) scan on every tick with 1,200-sample window. Min-max deque would be O(1) amortized if performance becomes a concern
 
 ### Risk Management Maturity
@@ -221,8 +221,8 @@ The EA can optionally open a reverse-direction position **after a losing close**
 
 ### Observability
 
-- **On-Chart Panel**: Shows range/candle, PPM/zone, spread vs adaptive limit, loss-reversal status (pending/armed, direction, delay countdown), daily trade count, reversal loss count, halt status
-- **Experts Log**: Detailed event logging for every loss-reversal arm/fire/skip, state recovery on init
+- **On-Chart Panel**: Shows range/candle, PPM/zone, spread vs adaptive limit, loss-reversal status (pending/armed, direction, delay countdown), daily trade count, reversal loss count, halt status, auto-regime hedge armed/disarmed state
+- **Experts Log**: Detailed event logging for every loss-reversal arm/fire/skip, regime transition (ARM/DISARM), breakout exit, state recovery on init
 
 ### Breaking Changes from v10.12
 
@@ -231,7 +231,7 @@ The EA can optionally open a reverse-direction position **after a losing close**
 | **`InpReverseAfterMin` removed** | Replaced by `InpEnableLossReversal` — different semantics (event-driven on loss, not time-based) |
 | **All `InpMart*` inputs removed** | 15 martingale inputs deleted; users must reconfigure `.set` files |
 | **`CMartingaleController` deleted** | 237 lines of martingale logic removed |
-| **`STATE_MAGIC` bumped to OMM5** | Old OMM4 state files safely discarded on load |
+| **`STATE_MAGIC` bumped to OMM6** | Old OMM4/OMM5 state files safely discarded on load |
 | **`REENTRY_CONTEXT` struct deleted** | Martingale re-entry context no longer needed |
 | **New inputs added** | `InpLossReversalDelaySec`, `InpReverseConfirm`, `InpMaxReverseLossesPerDay`, `InpMaxTradesPerDay`, `InpMinHoldSec` |
 
@@ -334,6 +334,9 @@ The EA can optionally open a reverse-direction position **after a losing close**
 | `InpHedgeLots` | `0.0` | Lot size for hedge legs; `0.0` = use `InpBaseLots` |
 | `InpMaxHedgeLegs` | `2` | Maximum concurrent chop-hedge legs (hard exposure cap) |
 | `InpBreakoutExit` | `true` | Close all hedge legs when ADX returns to directional (breakout detection, TH2 mitigation) |
+| `InpBreakoutConfirmBars` | `1` | Consecutive directional bars required before breakout exit fires (v10.17); `1` = legacy behavior |
+| **v10.18 — Auto-Adaptive Regime Hedge** | | |
+| `InpAutoRegimeHedge` | `false` | **Auto-arm/disarm chop-hedge on ADX regime transitions (FIFO-BREAKING; default OFF).** Requires `InpUseAdxFilter=true`. trend→chop arms STATE-style hedging; chop→trend disarms + flattens via `ManageBreakoutExit()`. |
 
 ---
 
@@ -343,17 +346,17 @@ Two preset files are shipped with the EA. Load them via MT4 Strategy Tester → 
 
 | File | Use Case | Key Settings |
 |---|---|---|
-| `conservative.set` | Personal accounts, initial demo testing | Lots=0.01, DD=5%, Trades=5/day, ADX=ON, ChopHedge=OFF |
-| `ftmo_challenge.set` | FTMO/MFF/The5ers challenge accounts | Lots=0.01, DD=4%, Trades=3/day, ADX=ON, WinRateHalt=ON, ChopHedge=OFF |
+| `conservative.set` | Personal accounts, initial demo testing | Lots=0.01, DD=5%, Trades=5/day, ADX=ON, ChopHedge=OFF, AutoRegime=OFF |
+| `ftmo_challenge.set` | FTMO/MFF/The5ers challenge accounts | Lots=0.01, DD=4%, Trades=3/day, ADX=ON, WinRateHalt=ON, ChopHedge=OFF, AutoRegime=OFF |
 
 > [!IMPORTANT]
-> Both presets ship with `InpEnableTrading=false` and `InpEnableChopHedge=false`. Enable trading only after demo-validating on your broker. **Never enable `InpEnableChopHedge` on prop-firm or FIFO/netting accounts.** When enabled, the default TRANSITION trigger mode is recommended.
+> Both presets ship with `InpEnableTrading=false`, `InpEnableChopHedge=false`, and `InpAutoRegimeHedge=false`. Enable trading only after demo-validating on your broker. **Never enable `InpEnableChopHedge` or `InpAutoRegimeHedge` on prop-firm or FIFO/netting accounts.** When chop-hedge is enabled, the default TRANSITION trigger mode is recommended.
 
 ## Overall Assessment
 
-**OneMinuteMan v10.16.1** is a technically sophisticated, well-documented MT4 scalping EA with fixed linear risk, comprehensive persistent risk controls, and a clean signal-only architecture. v10.16.1 fixes a **critical runtime defect**: the v10.16 TRANSITION chop-hedge trigger was always-false due to a same-tick ADX read in the state machine. The fix replaces the broken state machine with a **stateless closed-bar predicate** `ChopTransitionTriggered()`, activates `InpChopRearmBars`/`InpAdxHysteresis`, and deletes the dead code. Breakout exit (TH2) remains functional.
+**OneMinuteMan v10.18** is a technically sophisticated, well-documented MT4 scalping EA with fixed linear risk, comprehensive persistent risk controls, and a clean signal-only architecture. v10.18 adds **auto-adaptive regime-driven chop-hedging** via `InpAutoRegimeHedge`: the EA automatically arms/disarms chop-hedging based on ADX regime transitions, using a runtime mutable state layer (`m_hedge_active`, `m_current_regime`) since MQL4 `input` variables are immutable. Builds on v10.17 fixes (equity-guard bypass, timer breakout exit, breakout confirm bars, input validation). Default OFF, FIFO-safe by default.
 
-See PLAN.md v10.16.1 section for full root cause analysis, truth table, and SWOT.
+See [PLAN.md](PLAN.md) v10.18 section for full root cause analysis, design spec, SWOT, and verification checklist.
 
 ### Summary
 
@@ -364,8 +367,9 @@ See PLAN.md v10.16.1 section for full root cause analysis, truth table, and SWOT
 | **Code Quality** | ⭐⭐⭐⭐⭐ | Bug-fix documentation, guard clauses, input validation |
 | **Documentation** | ⭐⭐⭐⭐ | Clear README, comprehensive SWOT, preset profiles, but no official backtest results |
 | **Backtesting** | ⭐⭐ | No walk-forward results provided |
-| **FIFO Compatibility** | ⭐⭐⭐⭐ | Designed for FIFO/netting; needs live broker validation |
-| **Chop-Hedge** | ⭐⭐⭐⭐ | Stateless transition trigger (v10.16.1 fix), breakout exit, but no backtest evidence |
+| **FIFO Compatibility** | ⭐⭐⭐⭐ | Designed for FIFO/netting by default; chop-hedge and auto-regime break FIFO when enabled |
+| **Chop-Hedge** | ⭐⭐⭐⭐ | Stateless transition trigger (v10.16.1 fix), breakout exit, auto-regime lifecycle (v10.18), but no backtest evidence |
+| **Auto-Regime Hedge** | ⭐⭐⭐⭐ | Minimum-change, default-safe, fully reversible; pending MetaEditor compile + strategy-tester validation |
 
 ### Primary Caveats
 
@@ -373,10 +377,11 @@ See PLAN.md v10.16.1 section for full root cause analysis, truth table, and SWOT
 2. **Independent Validation Required**: You must perform your own backtests and demo validation before any live use
 3. **No Official Backtest Statistics**: Trust in the EA's edge must rest on your own testing and code/design quality
 4. **Reverse Leg Risk**: Both-leg losses (original + reverse) double per-cycle drawdown; `InpMaxReverseLossesPerDay` mitigates but does not eliminate this risk
-5. **Breaking Change from v10.12**: All martingale inputs removed; `.set` files must be recreated; state files are incompatible (OMM4 → OMM5)
+5. **Breaking Change from v10.12**: All martingale inputs removed; `.set` files must be recreated; state files are incompatible (OMM4 → OMM6)
 6. **Chop-Hedge Risk (v10.15+)**: When `InpEnableChopHedge=true`, multiple concurrent positions are opened. This breaks FIFO/netting compatibility and the fixed-linear-risk guarantee. Maximum exposure = `InpMaxHedgeLegs × InpHedgeLots`. Do not enable on prop-firm or netting broker accounts.
 7. **v10.16 TRANSITION Bug (Fixed in v10.16.1)**: The v10.16 state machine (`JustBecameChoppy` + `UpdateRegime`) was always-false. If you used v10.16 with TRANSITION mode, chop-hedging silently never fired. Upgrade to v10.16.1.
-8. **False Breakout Risk**: `InpBreakoutExit=true` closes hedge legs when ADX spikes above threshold. A 1-bar false breakout can close legs prematurely.
+8. **False Breakout Risk**: `InpBreakoutExit=true` closes hedge legs when ADX spikes above threshold. A 1-bar false breakout can close legs prematurely; `InpBreakoutConfirmBars` (v10.17) mitigates this.
+9. **Auto-Regime Hedge (v10.18)**: `InpAutoRegimeHedge=true` enables automatic chop-hedge lifecycle. Carries the same FIFO-breaking risk as manual `InpEnableChopHedge`. Regime state (`m_hedge_active`, `m_current_regime`) is not persisted across restarts (OMM7 open item) — a mid-chop restart will miss the current chop segment's hedging until the next trend→chop transition.
 
 ### Recommendation
 
