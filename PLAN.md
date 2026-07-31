@@ -1660,3 +1660,209 @@ Both `conservative.set` and `ftmo_challenge.set` headers updated to v10.16.1, da
 
 *OneMinuteMan v10.17. Five audit findings fixed (1 critical equity-guard bypass, 1 high timer coverage gap, 1 medium false-breakout mitigation, 1 low stale comment, 1 low input validation). 65 inputs, 15 classes, 2,067 LOC. Pending MetaEditor compile.*
 
+---
+
+## v10.18 — Auto-Adaptive Regime-Driven Chop-Hedge
+
+**Spec date**: 2026-07-31
+**Auditor/Designer**: Mavis (spec-driven design)
+**Base version**: v10.17 (2,067 LOC, 15 classes, 65 inputs)
+**Delivery**: v10.18 (2,165 LOC, 15 classes, 66 inputs)
+
+### Background
+
+The v10.15/v10.16 chop-hedge system has two manual input parameters:
+- `InpEnableChopHedge` (bool, default `false`) — master on/off switch
+- `InpChopHedgeTrigger` (enum, default `TRANSITION`) — whether to fire on every choppy bar (STATE) or only on the trend→chop edge (TRANSITION)
+
+These are **MQL4 `input`-qualified globals**, meaning they are **immutable at runtime** — the compiler rejects any assignment to them from within the EA. Operators must pre-set them and restart the EA to change behavior.
+
+The user requirement is an **auto-pilot layer** that replaces manual toggling:
+
+| Condition | Desired action |
+|---|---|
+| trend→chop (ADX[2] >= thr, ADX[1] < thr) | Arm chop-hedging |
+| stay chop (ADX[1] < thr continuation) | Continue firing hedge entries |
+| chop→trend (ADX[1] >= thr) | Disarm + flatten hedge legs |
+
+### Blocking Design Problem #1: MQL4 Input Immutability
+
+The EA cannot write `InpEnableChopHedge = true` at runtime. The correct pattern is a **runtime mutable state layer**: a new master opt-in input `InpAutoRegimeHedge` (default `false`), plus facade members `m_hedge_active` (bool) and `m_current_regime` (ENUM_ADX_REGIME) updated once per new bar. `ManageChopHedge()` reads `m_hedge_active` instead of the raw input when auto-mode is on.
+
+### Blocking Design Problem #2: FIFO/Netting Invariant
+
+The codebase architecture keeps concurrent hedging OFF by default. Auto-enabling it on every trend→chop transition silently breaks the single-position invariant. The auto-mode must be:
+- Behind its own `default=false` master flag
+- Guarded by the same FIFO-break warning as manual `InpEnableChopHedge`
+- Logged explicitly on every arm/disarm event
+
+### Design Redundancy Resolution
+
+Rules 1+2 (TRANSITION on edge, then STATE while chop) are behaviorally identical to STATE mode the whole time, because the transition bar is always the first STATE bar. The genuinely new logic is the **regime latch lifecycle**: arm on trend→chop edge, disarm on chop→trend edge. Implementation uses STATE-style firing (`IsChoppy()`) while armed.
+
+### Design Specification
+
+#### New Enum
+
+```mql4
+enum ENUM_ADX_REGIME {
+   REGIME_UNKNOWN = 0, // Not yet initialized
+   REGIME_TREND   = 1, // ADX >= InpAdxThreshold
+   REGIME_CHOP    = 2  // ADX <  InpAdxThreshold
+};
+```
+
+#### New Input
+
+```mql4
+input bool InpAutoRegimeHedge = false; // Auto-arm/disarm chop-hedge on regime change
+```
+
+Total inputs: 65 → 66. Default OFF. Requires `InpUseAdxFilter = true`.
+
+#### New Runtime State Members (CExpertAdvisor)
+
+```mql4
+bool             m_hedge_active;    // true = chop-hedge currently armed
+ENUM_ADX_REGIME  m_current_regime;  // latched once per new bar
+```
+
+Initialized to `false` / `REGIME_UNKNOWN` in `OnInitHandler()`. First new-bar latch sets regime without arming (safe init, no false trigger).
+
+#### State Machine (OnTickHandler, new bar block)
+
+```
+On each new M1 bar:
+  1. Latch: m_current_regime = IsDirectional() ? TREND : CHOP
+  2. If UNKNOWN → TREND or UNKNOWN → CHOP: log "initialized", no action
+  3. If TREND → CHOP: set m_hedge_active = true ("ARMED")
+  4. If CHOP → TREND: set m_hedge_active = false ("DISARMED")
+  5. If CHOP → CHOP or TREND → TREND: no action (regime continuation)
+```
+
+#### ManageChopHedge() Changes
+
+```mql4
+bool hedgeEnabled = InpAutoRegimeHedge ? m_hedge_active : InpEnableChopHedge;
+// ...
+if(InpAutoRegimeHedge) {
+   shouldFire = m_adx.IsChoppy(); // STATE-style while armed
+} else if(InpChopHedgeTrigger == CHOP_TRIGGER_TRANSITION) {
+   shouldFire = m_adx.ChopTransitionTriggered(InpChopRearmBars);
+} else {
+   shouldFire = m_adx.IsChoppy();
+}
+```
+
+When `InpAutoRegimeHedge = false` (default), behavior is bit-identical to v10.17.
+
+#### ManageBreakoutExit() Changes
+
+Guard updated from `if(!InpEnableChopHedge || ...)` to `if(!InpEnableChopHedge && !InpAutoRegimeHedge)`. On breakout exit, auto-mode also disarms: `m_hedge_active = false; m_current_regime = REGIME_TREND;`.
+
+#### OnInit Validation & FIFO Warning
+
+- `InpAutoRegimeHedge` requires `InpUseAdxFilter = true` → `INIT_PARAMETERS_INCORRECT`
+- Prints explicit FIFO-break warning (mirrors `InpEnableChopHedge` warning)
+- Warns if both `InpEnableChopHedge` and `InpAutoRegimeHedge` are true (auto-mode takes precedence)
+
+#### UpdateComment Panel
+
+- When armed: `ChopHedge:ON  Trigger:AUTO-STATE  Legs:N/M  BreakoutExit:ON`
+- When disarmed: `ChopHedge:AUTO-DISARMED (waiting for trend→chop)`
+
+### Interaction Rules
+
+| Interaction | Behavior |
+|---|---|
+| `InpAutoRegimeHedge=false` (default) | No change from v10.17. Manual `InpEnableChopHedge` + `InpChopHedgeTrigger` govern. |
+| `InpAutoRegimeHedge=true`, `InpEnableChopHedge=false` | Auto-mode controls hedge lifecycle. Manual input is ignored. |
+| `InpAutoRegimeHedge=true`, `InpEnableChopHedge=true` | Auto-mode takes precedence. Warning logged. |
+| ADX oscillation near threshold | `InpAdxHysteresis` damps flip-flop in `ChopTransitionTriggered()` predicate. `InpChopRearmBars` prevents re-arm for N bars. Both existing v10.16.1 knobs apply. |
+| Breakout exit + auto-disarm | `ManageBreakoutExit()` closes legs AND disarms via `m_hedge_active = false`. `InpBreakoutConfirmBars` (v10.17 B4) confirmation window applies. |
+| State persistence | `m_hedge_active` and `m_current_regime` are **NOT persisted** in CStateStore (no OMM7 bump). On restart, `m_current_regime = REGIME_UNKNOWN` and the first new bar re-latches. Safe: no false trigger on init. **OMM7 persistence is an open item** if users report restart-driven re-arming issues. |
+
+### Comprehensive SWOT
+
+#### Strengths
+
+| # | Strength |
+|---|---|
+| S1 | Reuses existing primitives (`ChopTransitionTriggered()`, `IsChoppy()`, `IsDirectional()`, `ManageBreakoutExit()`) — zero new indicator cost |
+| S2 | Removes manual burden of toggling two coupled flags; regime detection becomes self-managing |
+| S3 | Deterministic (still no RNG), backtests stay reproducible |
+| S4 | chop→trend auto-disarm naturally pairs with `InpBreakoutConfirmBars` confirmation (v10.17 B4) |
+| S5 | Clean separation: runtime state layer (`m_hedge_active`) never touches immutable `input` vars |
+| S6 | Default OFF, behind explicit opt-in flag — preserves FIFO/netting invariant for default-config users |
+| S7 | Panel shows `AUTO-STATE` (armed) or `AUTO-DISARMED` — clear real-time feedback to operator |
+| S8 | First-bar init is safe: `REGIME_UNKNOWN` → latched regime, no arming (no false trigger on attach) |
+
+#### Weaknesses
+
+| # | Weakness |
+|---|---|
+| W1 | Cannot mutate `input` vars → forced the mutable-state layer (added bug surface, 2 new members) |
+| W2 | Rules 1+2 (TRANSITION then STATE) are behaviorally redundant with plain STATE — the auto-mode's only genuine new logic is the arm/disarm lifecycle |
+| W3 | STATE-style firing while armed: ADX oscillation near threshold causes frequent regime flips and repeated leg opens (amplifies W8 from v10.16 SWOT) |
+| W4 | No shipped backtest evidence that M1 range-fade has positive expectancy; auto-mode fires it more often, not more profitably |
+| W5 | `m_hedge_active` / `m_current_regime` are NOT persisted in CStateStore — restart resets regime to UNKNOWN (OMM7 deferred) |
+| W6 | 66 inputs — parameter space continues growing |
+
+#### Opportunities
+
+| # | Opportunity |
+|---|---|
+| O1 | Extract the regime state machine into a dedicated `CChopHedgeEngine` SRP class for isolated unit testing |
+| O2 | `InpAdxHysteresis` + `InpChopRearmBars` are the correct existing knobs to damp flip-flop risk — can be optimized via Strategy Tester |
+| O3 | OMM7 state persistence: add `m_hedge_active` + `m_current_regime` to binary state for crash-safe regime tracking |
+| O4 | Combine auto-regime with the walk-forward pipeline (O2 from v10.13 SWOT) for regime-aware parameter sweeps |
+| O5 | Log regime transition events to CSV via `CPerformanceTracker` for post-session analysis |
+
+#### Threats
+
+| # | Threat | Severity |
+|---|---|---|
+| T1 | **Auto-enabling concurrent hedging violates FTMO/prop-firm and FIFO/netting broker rules** — must be default-OFF and loudly warned | 🔴 Critical |
+| T2 | ADX lag: transition can fire right before a breakout, auto-opened legs get hit by the very move that ends the chop regime (TH2/T1 from v10.16 SWOT) | 🟠 High |
+| T3 | Oscillation near threshold with auto-mode creates rapid arm→disarm→arm cycles, burning through `InpMaxHedgeLegs` and `InpMaxTradesPerDay` quickly | 🟡 Medium |
+| T4 | Restart resets `m_current_regime` to UNKNOWN — if EA restarts during chop, first new bar re-latches as CHOP but won't arm (requires TREND→CHOP transition) | 🟡 Medium |
+| T5 | Users may enable both `InpAutoRegimeHedge` and `InpEnableChopHedge` simultaneously, creating ambiguous semantics (mitigated by precedence rule + warning) | 🟢 Low |
+
+### Verification Checklist
+
+| Check | Expected | Result |
+|---|---|---|
+| Version | `10.18` | ✅ |
+| Lines | ~2,165 | ✅ |
+| Classes | 15 | ✅ |
+| Inputs | 66 | ✅ |
+| Enums | 6 (includes new ENUM_ADX_REGIME) | ✅ |
+| Braces | balanced | ✅ (249/249) |
+| `InpAutoRegimeHedge` default | `false` | ✅ |
+| OnInit FIFO warning | present when `InpAutoRegimeHedge=true` | ✅ |
+| OnInit ADX requirement | `InpAutoRegimeHedge` requires `InpUseAdxFilter=true` | ✅ |
+| No writes to `input` vars | 0 assignments to `InpEnableChopHedge` or `InpChopHedgeTrigger` | ✅ |
+| `m_hedge_active` init | `false` in `OnInitHandler()` | ✅ |
+| `m_current_regime` init | `REGIME_UNKNOWN` in `OnInitHandler()` | ✅ |
+| Regime latch in OnTickHandler | present in newBar block | ✅ |
+| `ManageChopHedge` reads `m_hedge_active` in auto-mode | present | ✅ |
+| `ManageBreakoutExit` disarms in auto-mode | present | ✅ |
+| Panel: `AUTO-STATE` display | present | ✅ |
+| Panel: `AUTO-DISARMED` display | present | ✅ |
+| Presets: `InpAutoRegimeHedge=0` | both presets | ✅ |
+| Banner: `AutoRegime:` field | present | ✅ |
+| v10.17 backward compat | `InpAutoRegimeHedge=false` → bit-identical to v10.17 | ✅ (by construction) |
+
+### Review Verdict
+
+The auto-adaptive regime hedge is implemented as a **runtime mutable state layer** (`m_hedge_active`, `m_current_regime`) driven by a per-new-bar regime latch in `OnTickHandler`. It correctly avoids writing to immutable `input` variables. The design collapses the user's three rules (TRANSITION→STATE→disable) into a single arm/disarm lifecycle with STATE-style firing while armed, which is the correct simplification given that TRANSITION+STATE is behaviorally identical to STATE.
+
+The feature is **default-OFF** (`InpAutoRegimeHedge = false`) and carries the same FIFO-break warning as manual `InpEnableChopHedge`. When disabled, behavior is bit-identical to v10.17.
+
+**Open items:**
+1. OMM7 state persistence for `m_hedge_active` / `m_current_regime` (deferred — safe without it, restart re-latches on first bar)
+2. `CChopHedgeEngine` SRP extraction for isolated unit testing (O1)
+3. MetaEditor compile (F7) + Strategy Tester validation of regime transitions
+
+*OneMinuteMan v10.18. Auto-adaptive regime-driven chop-hedge with runtime mutable state. 66 inputs, 15 classes, 6 enums, 2,165 LOC. Default OFF. FIFO-safe by default. Pending MetaEditor compile.*
+

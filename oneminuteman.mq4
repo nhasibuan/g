@@ -5,10 +5,10 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, nhasibuan"
 #property link      "https://github.com/nhasibuan/g"
-#property version   "10.17"
+#property version   "10.18"
 #property strict
-#property description "OneMinuteMan v10.17: Signal-only M1 scalper with event-driven loss-reversal and transition-based chop-hedging."
-#property description "v10.17: B2 equity-guard bypass fix (CRITICAL), B3 timer breakout exit, B4 breakout confirm bars, B5 input validation."
+#property description "OneMinuteMan v10.18: Signal-only M1 scalper with auto-adaptive regime-driven chop-hedging."
+#property description "v10.18: Auto-regime hedge (InpAutoRegimeHedge) — arms on trend→chop, disarms on chop→trend. Runtime mutable state."
 #property description "No martingale. Fixed linear risk. FIFO/netting compatible by default (chop-hedge breaks FIFO when enabled)."
 #property description "ATR-dynamic risk, virtual SL with safety net, break-even, persistent equity guards."
 
@@ -67,6 +67,14 @@ enum ENUM_REVERSE_CONFIRM {
 enum ENUM_CHOP_TRIGGER {
    CHOP_TRIGGER_STATE      = 0, // STATE: fire every choppy bar (v10.15 behavior)
    CHOP_TRIGGER_TRANSITION = 1  // TRANSITION: fire only on trend->chop edge (v10.16)
+};
+
+// v10.18: ADX regime enum for auto-adaptive regime-driven chop-hedge.
+// Used as runtime mutable state (m_current_regime); NOT an input variable.
+enum ENUM_ADX_REGIME {
+   REGIME_UNKNOWN = 0, // Not yet initialized (first bar)
+   REGIME_TREND   = 1, // ADX >= InpAdxThreshold (directional market)
+   REGIME_CHOP    = 2  // ADX <  InpAdxThreshold (sideways/choppy market)
 };
 
 enum TYPE_CANDLESTICK {
@@ -206,6 +214,11 @@ input double             InpHedgeLots        = 0.0;                 // 0.0 = use
 input int                InpMaxHedgeLegs     = 2;                   // Max concurrent chop-hedge legs (hard exposure cap). Range: 1-5.
 input bool               InpBreakoutExit     = true;                // Close hedge legs on breakout (ADX returns to directional)
 input int                InpBreakoutConfirmBars = 1;                // v10.17 (B4): Consecutive directional bars before breakout exit (1=legacy, 2-3=less sensitive)
+//--- Auto-Adaptive Regime Hedge (v10.18)
+//    When enabled, the EA automatically arms/disarms chop-hedging based on ADX regime.
+//    trend→chop: arms STATE-style hedging. chop→trend: disarms + closes legs.
+//    WARNING: FIFO-BREAKING (same as manual InpEnableChopHedge). Default OFF.
+input bool               InpAutoRegimeHedge  = false;               // v10.18: Auto-arm/disarm chop-hedge on regime change (FIFO-BREAKING; default OFF)
 
 //==================================================================
 // SECTION 2 -- CONSTANTS, STRUCTURES & UTILITIES
@@ -1421,6 +1434,12 @@ private:
    int              m_trades_today;       // total trades opened today
    bool             m_last_was_reversal;  // true if the current/last position was a reverse leg
 
+   // v10.18: Auto-adaptive regime-driven chop-hedge runtime state.
+   // MQL4 input variables are immutable — cannot reassign InpEnableChopHedge at runtime.
+   // These mutable members are driven by the regime latch in OnTickHandler (new bar).
+   bool             m_hedge_active;        // true = chop-hedge is currently armed (auto-mode)
+   ENUM_ADX_REGIME  m_current_regime;      // current ADX regime (latched once per new bar)
+
    void SaveState() {
       m_store.Save(m_vsl, m_halted, m_halt_until,
                    m_guard.Baseline(), m_guard.DayStamp(),
@@ -1657,7 +1676,11 @@ private:
    //                        current bar choppy). Prevents re-firing on consecutive
    //                        choppy bars and reduces false flips near threshold.
    void ManageChopHedge(bool allowFresh) {
-      if(!InpEnableChopHedge || !InpEnableTrading) return;
+      // Determine if chop-hedge is active:
+      //   Manual mode: InpEnableChopHedge (static input, user-set)
+      //   Auto mode:   m_hedge_active (runtime state, regime-driven)
+      bool hedgeEnabled = InpAutoRegimeHedge ? m_hedge_active : InpEnableChopHedge;
+      if(!hedgeEnabled || !InpEnableTrading) return;
       if(!allowFresh)                              return; // fire on new bar only
 
       // v10.16.1: Select trigger mode
@@ -1665,7 +1688,13 @@ private:
       // which compares ADX[1] vs ADX[2..1+rearmBars] across different bars.
       // (v10.16 JustBecameChoppy was ALWAYS FALSE — see class header comment.)
       bool shouldFire;
-      if(InpChopHedgeTrigger == CHOP_TRIGGER_TRANSITION) {
+      if(InpAutoRegimeHedge) {
+         // v10.18 auto-mode: always STATE-style firing while m_hedge_active is true.
+         // The regime latch already handled the transition edge; while armed, fire every
+         // choppy bar (STATE behavior). This is correct because TRANSITION+STATE
+         // collapses to STATE (the transition bar is always the first STATE bar).
+         shouldFire = m_adx.IsChoppy();
+      } else if(InpChopHedgeTrigger == CHOP_TRIGGER_TRANSITION) {
          shouldFire = m_adx.ChopTransitionTriggered(InpChopRearmBars); // v10.16.1 fix
       } else {
          shouldFire = m_adx.IsChoppy();          // v10.15 behavior: fires every choppy bar
@@ -1719,7 +1748,8 @@ private:
    // NOTE: This method implicitly assumes ALL open positions are hedge legs.
    // If used in future with mixed position types, refactor to filter by ticket/magic.
    void ManageBreakoutExit() {
-      if(!InpEnableChopHedge || !InpBreakoutExit) return;
+      if(!InpEnableChopHedge && !InpAutoRegimeHedge) return; // neither mode active
+      if(!InpBreakoutExit) return;
       if(m_exec.CountPositions() == 0)             return; // nothing to close
 
       // v10.17 (B4): Confirmation window — require InpBreakoutConfirmBars consecutive
@@ -1739,6 +1769,13 @@ private:
             " >= threshold ", DoubleToString(InpAdxThreshold, 1),
             " for ", confirmBars, " bars. Closing ", m_exec.CountPositions(), " hedge legs.");
       m_exec.CloseAll(m_spread.EffSlippage(), m_vsl);
+
+      // v10.18: Auto-disarm on breakout when in auto-regime mode
+      if(InpAutoRegimeHedge && m_hedge_active) {
+         m_hedge_active = false;
+         m_current_regime = REGIME_TREND;
+         Print("AutoRegime: chop->trend breakout detected. Hedge DISARMED.");
+      }
    }
 
    // v10.14: Rate-limited to 1 Hz to avoid StringFormat on every 50ms timer tick.
@@ -1747,7 +1784,7 @@ private:
       if(now == m_last_comment_time) return; // skip if already updated this second
       m_last_comment_time = now;
 
-      string msg = "=== OneMinuteMan v10.17 (no-mart) ===\n";
+      string msg = "=== OneMinuteMan v10.18 (no-mart) ===\n";
       msg += StringFormat("Symbol:%-6s  Engine:%s\n", Symbol(), TFLabel());
       msg += "--- Range ---\n";
       msg += StringFormat("High:%.5f  Low:%.5f  Range:%.5f\n",
@@ -1772,13 +1809,21 @@ private:
          msg += StringFormat("ADX:%.1f %s (thr:%.0f hyst:%.0f)%s\n",
                              m_adx.Value(), regimeTag, InpAdxThreshold, InpAdxHysteresis, edgeTag);
       }
-      // v10.15/v10.16: Chop-hedge status row
-      if(InpEnableChopHedge)
+      // v10.18: Updated chop-hedge display for auto-mode
+      if(InpEnableChopHedge || (InpAutoRegimeHedge && m_hedge_active)) {
+         string trigLabel;
+         if(InpAutoRegimeHedge)
+            trigLabel = "AUTO-STATE";
+         else
+            trigLabel = (InpChopHedgeTrigger == CHOP_TRIGGER_TRANSITION) ? "EDGE" : "STATE";
          msg += StringFormat("ChopHedge:ON  Trigger:%s  Legs:%d/%d  BreakoutExit:%s\n",
-                             (InpChopHedgeTrigger == CHOP_TRIGGER_TRANSITION) ? "EDGE" : "STATE",
+                             trigLabel,
                              m_exec.CountPositions(),
                              InpMaxHedgeLegs,
                              InpBreakoutExit ? "ON" : "OFF");
+      } else if(InpAutoRegimeHedge && !m_hedge_active) {
+         msg += "ChopHedge:AUTO-DISARMED (waiting for trend→chop)\n";
+      }
       msg += "--- Trade ---\n";
       msg += StringFormat("Trading:%s  Spread:%d/%d  Equity:$%.2f  DD:%.2f%%\n",
                           InpEnableTrading ? "ON" : "OFF",
@@ -1838,6 +1883,10 @@ public:
       m_trades_today          = 0;
       m_last_was_reversal     = false;
 
+      // v10.18: Auto-adaptive regime state init
+      m_hedge_active    = false;         // start disarmed; first new-bar latch will set regime
+      m_current_regime  = REGIME_UNKNOWN; // will be latched on first new bar
+
       // --- input validation ---
       if(InpWindowSize < 60 || InpWindowSize > 50000)
          { Print("Error: InpWindowSize must be 60-50000"); return INIT_PARAMETERS_INCORRECT; }
@@ -1882,6 +1931,21 @@ public:
       // v10.15: FIFO-compatibility warning when chop-hedge is enabled
       if(InpEnableChopHedge) {
          Print("WARNING: InpEnableChopHedge=true.");
+         Print("  This opens concurrent positions (FIFO-BREAKING).");
+         Print("  Violates most prop-firm rules and US FIFO regulation.");
+         Print("  Only enable on brokers explicitly permitting long+short hedging.");
+      }
+      // v10.18: Auto-regime hedge FIFO warning
+      if(InpAutoRegimeHedge) {
+         if(!InpUseAdxFilter) {
+            Print("Error: InpAutoRegimeHedge requires InpUseAdxFilter=true");
+            return INIT_PARAMETERS_INCORRECT;
+         }
+         if(InpEnableChopHedge) {
+            Print("WARNING: InpAutoRegimeHedge=true AND InpEnableChopHedge=true. Auto-mode takes precedence.");
+         }
+         Print("WARNING: InpAutoRegimeHedge=true.");
+         Print("  Chop-hedge will auto-arm on EVERY trend→chop transition.");
          Print("  This opens concurrent positions (FIFO-BREAKING).");
          Print("  Violates most prop-firm rules and US FIFO regulation.");
          Print("  Only enable on brokers explicitly permitting long+short hedging.");
@@ -1968,8 +2032,9 @@ public:
          { Print("Error: Timer failed"); return INIT_FAILED; }
 
       m_initialized = true;
-      Print("OneMinuteMan v10.16.2 initialized. ADX:", InpUseAdxFilter?"ON":"OFF",
+      Print("OneMinuteMan v10.18 initialized. ADX:", InpUseAdxFilter?"ON":"OFF",
             " ChopHedge:", InpEnableChopHedge?"ON (FIFO-BREAKING)":"OFF",
+            " AutoRegime:", InpAutoRegimeHedge?"ON (FIFO-BREAKING)":"OFF",
             " Trigger:", (InpChopHedgeTrigger==CHOP_TRIGGER_TRANSITION)?"TRANSITION":"STATE",
             " BreakoutExit:", InpBreakoutExit?"ON":"OFF",
             " WinRateHalt:", InpUseWinRateHalt?"ON":"OFF",
@@ -2026,6 +2091,39 @@ public:
          if(m_candle_engine.Recognize(1, bar)) {
             m_candle       = bar;
             m_candle_valid = true;
+         }
+
+         // v10.18: Auto-adaptive regime latch.
+         // Latches the current ADX regime once per new bar. Arms m_hedge_active on
+         // trend→chop transition; disarms on chop→trend (also handled by ManageBreakoutExit).
+         // Uses existing stateless predicates — no new indicator math required.
+         if(InpAutoRegimeHedge) {
+            ENUM_ADX_REGIME prevRegime = m_current_regime;
+            m_current_regime = m_adx.IsDirectional() ? REGIME_TREND : REGIME_CHOP;
+
+            if(prevRegime == REGIME_UNKNOWN) {
+               // First bar after init: latch regime without arming (safe init, no false trigger)
+               Print("AutoRegime: initialized. Current regime=",
+                     (m_current_regime==REGIME_TREND) ? "TREND" : "CHOP");
+            }
+            else if(prevRegime == REGIME_TREND && m_current_regime == REGIME_CHOP) {
+               // trend→chop transition detected: ARM chop-hedge
+               if(!m_hedge_active) {
+                  m_hedge_active = true;
+                  Print("AutoRegime: trend->chop transition. Hedge ARMED.",
+                        " ADX[1]=", DoubleToString(m_adx.ValueAt(1), 1),
+                        " ADX[2]=", DoubleToString(m_adx.ValueAt(2), 1),
+                        " thr=", DoubleToString(InpAdxThreshold, 1));
+               }
+            }
+            else if(prevRegime == REGIME_CHOP && m_current_regime == REGIME_TREND) {
+               // chop→trend transition detected: DISARM (ManageBreakoutExit also handles this)
+               if(m_hedge_active) {
+                  m_hedge_active = false;
+                  Print("AutoRegime: chop->trend transition. Hedge DISARMED.",
+                        " ADX[1]=", DoubleToString(m_adx.ValueAt(1), 1));
+               }
+            }
          }
       }
 

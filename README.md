@@ -4,9 +4,9 @@
 
 ## Overview
 
-**OneMinuteMan (OMM)** is a single-file, component-based MQL4 Expert Advisor at **version 10.17**, designed for M1 (1-minute) timeframe scalping. Built by [Norman Hasibuan](https://github.com/nhasibuan) with AI-assisted development, it combines candlestick pattern recognition, a ZigZag-based Pips-Per-Minute (PPM) momentum engine, an **ADX regime filter** (with stateless transition-based chop-hedging), ATR-dynamic risk management, virtual stop-losses, an event-driven loss-reversal system, and a **rolling win-rate performance tracker**.
+**OneMinuteMan (OMM)** is a single-file, component-based MQL4 Expert Advisor at **version 10.18**, designed for M1 (1-minute) timeframe scalping. Built by [Norman Hasibuan](https://github.com/nhasibuan) with AI-assisted development, it combines candlestick pattern recognition, a ZigZag-based Pips-Per-Minute (PPM) momentum engine, an **ADX regime filter** (with stateless transition-based chop-hedging and **auto-adaptive regime-driven hedge lifecycle**), ATR-dynamic risk management, virtual stop-losses, an event-driven loss-reversal system, and a **rolling win-rate performance tracker**.
 
-**v10.17 BUG-FIX & HARDENING:** Five audit findings addressed. **B2 (CRITICAL):** `ManageReverseEntry()` now calls `EquityGuardOK()` — closes a latent bypass where a loss-reversal could fire after `m_vsl.Enforce()` dropped equity below `InpMinEquity` on the same timer tick. **B3 (HIGH):** `ManageBreakoutExit()` wired in `OnTimerHandler` for responsive breakout detection in low-tick environments. **B4 (MEDIUM):** New `InpBreakoutConfirmBars` input (default 1) requires N consecutive directional bars before closing hedge legs, mitigating false-breakout premature closure (T10). **B5:** 8 additional input validations in `OnInit`. **B1:** Fixed stale OMM5 comment in `CStateStore` header.
+**v10.18 AUTO-ADAPTIVE REGIME HEDGE:** New `InpAutoRegimeHedge` input (default OFF) enables automatic chop-hedge lifecycle management. On trend→chop transition, the EA arms STATE-style chop-hedging; on chop→trend transition, it disarms and flattens legs via `ManageBreakoutExit()`. Implemented as a **runtime mutable state layer** (`m_hedge_active`, `m_current_regime` of type `ENUM_ADX_REGIME`) since MQL4 `input` variables are immutable at runtime. FIFO-BREAKING when enabled — carries the same warning as manual `InpEnableChopHedge`. When `InpAutoRegimeHedge=false` (default), behavior is bit-identical to v10.17.
 
 The EA forcibly operates on M1 candle data regardless of the chart timeframe, enabling focused 1-minute scalping strategy with comprehensive protection.
 
@@ -16,7 +16,7 @@ The EA forcibly operates on M1 candle data regardless of the chart timeframe, en
 
 **OneMinuteMan** is a MetaTrader 4 Expert Advisor (EA) written in MQL4, designed for M1 (1‑minute) scalping with **fixed linear risk** and comprehensive risk mitigations. It's a single `.mq4` file, internally organized into **15 single‑responsibility classes** behind a `CExpertAdvisor` facade.
 
-**v10.17:** Bug-fix & hardening release. Critical equity-guard bypass in `ManageReverseEntry()` fixed (B2). Breakout exit wired in timer handler for low-tick environments (B3). New `InpBreakoutConfirmBars` input for false-breakout mitigation (B4). 8 additional input validations (B5). Stale OMM5 comment fixed (B1). Stateless `ChopTransitionTriggered()` predicate retained from v10.16.1. `InpChopRearmBars` and `InpAdxHysteresis` runtime-effective. All 3 position-opening paths now have consistent equity-guard gating.
+**v10.18:** Auto-adaptive regime-driven chop-hedge. New `InpAutoRegimeHedge` input auto-arms/disarms hedging on ADX regime transitions. Runtime mutable state (`m_hedge_active`, `m_current_regime`) since MQL4 inputs are immutable. STATE-style firing while armed. Builds on v10.17 fixes (equity-guard bypass, timer breakout exit, breakout confirm bars, input validation). Default OFF, FIFO-safe by default.
 
 ---
 
@@ -47,7 +47,7 @@ The EA is structured as a **single-file component architecture** using classic O
 - **`CCandleEngine`** — Classifies 11 candlestick types (Hammer, Marubozu, 3 Doji variants, Long/Short, Spinning Top, Inverted Hammer) and derives trend direction vs SMA
 - **`CPpmEngine`** — Uses ZigZag indicator to compute pips-per-minute efficiency; classifies zones as LOW / MEDIUM / HIGH
 - **`CVolumeFilter`** — Tick-volume spike gate; blocks entries when volume is below threshold to ensure liquidity confirmation
-- **`CAdxFilter`** _(v10.14/v10.15/v10.17)_ — ADX trend-strength regime filter: blocks fresh entries in choppy markets (v10.14), optionally opens mean-reversion range-fade positions in chop via `InpEnableChopHedge` (v10.15), supports a stateless transition trigger `ChopTransitionTriggered()` that fires only on trend→chop crossing (v10.16.1 fix), breakout exit with configurable confirmation window `InpBreakoutConfirmBars` (v10.17 B4)
+- **`CAdxFilter`** _(v10.14/v10.15/v10.18)_ — ADX trend-strength regime filter: blocks fresh entries in choppy markets (v10.14), optionally opens mean-reversion range-fade positions in chop via `InpEnableChopHedge` (v10.15), supports stateless transition trigger `ChopTransitionTriggered()` (v10.16.1), breakout exit with configurable confirmation `InpBreakoutConfirmBars` (v10.17), and **auto-adaptive regime-driven hedge lifecycle** via `InpAutoRegimeHedge` (v10.18)
 
 #### Session, Risk & Performance
 - **`CSessionClock`** — Timezone-aware session window; daily halt flag persists across restarts
@@ -396,11 +396,11 @@ See PLAN.md v10.16.1 section for full root cause analysis, truth table, and SWOT
 
 - **Repository**: [nhasibuan/g](https://github.com/nhasibuan/g)
 - **Author**: [Norman Hasibuan (@nhasibuan)](https://github.com/nhasibuan)
-- **Latest Version**: v10.17 (July 30, 2026) — **bug-fix & hardening**: B2 critical equity-guard bypass fix in `ManageReverseEntry()`, B3 timer breakout exit wiring, B4 `InpBreakoutConfirmBars` for false-breakout mitigation, B5 8 additional input validations, B1 stale OMM5 comment fix
+- **Latest Version**: v10.18 (July 31, 2026) — **auto-adaptive regime hedge**: `InpAutoRegimeHedge` auto-arms/disarms chop-hedging on ADX regime transitions. Runtime mutable state layer. Default OFF. Builds on v10.17 (equity-guard fix, timer breakout, confirm bars, input validation)
 - **License**: [MIT](LICENSE)
 - **Contributing**: [CONTRIBUTING.md](CONTRIBUTING.md)
 - **For Issues/Questions**: Refer to repository documentation and risk warnings
 
 ---
 
-*OneMinuteMan v10.17 is a disciplined, signal-only M1 scalper with 5 audit findings fixed (1 critical equity-guard bypass, 1 high timer coverage gap, 1 medium false-breakout mitigation, 1 low stale comment, 1 low input validation). Fixed risk per trade. No martingale. No compounding. 65 configurable inputs. 15 SRP classes. 12 serial entry guards. All 3 position-opening paths have consistent equity-guard gating. Stateless chop-hedge trigger (TRANSITION default, STATE available). Breakout exit with configurable confirmation window. Demo thoroughly and trade responsibly.*
+*OneMinuteMan v10.18 is a disciplined, signal-only M1 scalper with auto-adaptive regime-driven chop-hedging. Fixed risk per trade. No martingale. No compounding. 66 configurable inputs. 15 SRP classes. 12 serial entry guards. Runtime mutable state layer for regime lifecycle (MQL4 inputs are immutable). All 3 position-opening paths have consistent equity-guard gating. Breakout exit with confirmation window. Default FIFO-safe. Demo thoroughly and trade responsibly.*
