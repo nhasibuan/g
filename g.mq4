@@ -1,24 +1,38 @@
 //+------------------------------------------------------------------+
 //|                                        EA_HOKKY_V5_HEDGE.mq4     |
-//| HOKKY V5.0 - Hedged Grid + Trailing Stops + DD Reduction          |
-//| Single-file, hardened, MQL4 best-practice rebuild.                |
+//| HOKKY V5.01 - Hedged Grid + Trailing Stops + DD Reduction        |
+//| Single-file, hardened, MQL4 best-practice rebuild.               |
 //|                                                                  |
-//| NEW vs V4.30:                                                     |
-//|   - Hedge grid: L1,L2,... alternate direction (pendulum grid)     |
-//|   - Trailing stop service (per order, ATR-based)                  |
-//|   - Hedge offset DD reduction (harvest winning side)              |
-//|   - Absolute loss guards (equity floor, basket money stop)        |
-//|   - Both directions work independently and simultaneously         |
+//| NEW vs V4.30:                                                    |
+//|   - Hedge grid: L1,L2,... alternate direction (pendulum grid)    |
+//|   - Trailing stop service (per order, ATR-based)                 |
+//|   - Hedge offset DD reduction (harvest winning side)             |
+//|   - Absolute loss guards (equity floor, basket money stop)       |
+//|   - Both directions work independently and simultaneously        |
 //|                                                                  |
-//| FIXES:                                                            |
-//|   - MaxLevel=8, Multiplier=1.30, UseBasketSL=true, Journal=true   |
-//|   - Trend filter on H1, MA(50) defaults                           |
-//|   - Non-blocking close-all FSM (no Sleep in tick)                 |
-//|   - Persistent schema guard, instance lease, protection fault     |
+//| FIXES:                                                           |
+//|   - MaxLevel=8, Multiplier=1.30, UseBasketSL=true, Journal=true  |
+//|   - Trend filter on H1, MA(50) defaults                          |
+//|   - Non-blocking close-all FSM (no Sleep in tick)                |
+//|   - Persistent schema guard, instance lease, protection fault    |
+//|                                                                  |
+//| V5.01 CLEANUP (XAUUSD M1 hardening):                             |
+//|   - Renamed misleading *_Pips inputs: these are ATR multipliers, |
+//|     not pips. InpBasketSL_Pips -> InpBasketSL_ATR,               |
+//|     InpHardSLPips -> InpHardSL_ATR. (.set keys updated to match. |
+//|   - De-duplicated redundant step-check in TrailOneSell (was a    |
+//|     double-tested gate; now mirrors TrailOneBuy).                |
+//|   - Clarified InpDDResetMode/InpDDCooldownMin: COOLDOWN with     |
+//|     DDCooldownMin<=0 is a PERMANENT latch until manual reset.    |
+//|   - Clarified InpHedgeMode: requires a HEDGING (non-netting)     |
+//|     account; on a netting server both legs net out and the grid  |
+//|     malfunctions silently.                                       |
+//|   - Clarified InpSlippage: in points; raise (30-50) for volatile |
+//|     symbols such as XAUUSD so risk-exit fills succeed in spikes. |
 //+------------------------------------------------------------------+
 #property strict
 #property copyright "HOKKY V5 HEDGE"
-#property version   "5.00"
+#property version   "5.01"
 #property description "Hedged grid EA with trailing stops, DD reduction, and layered risk controls."
 
 #include <stderror.mqh>
@@ -37,7 +51,7 @@ enum ENUM_STATE_COMMAND { STATE_KEEP = 0, STATE_RESET_DD_LATCH = 1, STATE_RESET_
 //--- =================== INPUTS: IDENTITY ====================
 input string              InpEA_Comment           = "HOKKY_V5";
 input int                 InpMagicNumber          = 0;       // 0 = persisted auto magic
-input int                 InpSlippage             = 3;       // points
+input int                 InpSlippage             = 3;       // points; raise to 30-50 for volatile symbols (XAUUSD) so risk-exit OrderClose fills succeed in spikes
 input string              InpObjectPrefix         = "H5";
 input bool                InpPurgeStateOnInit     = false;
 input ENUM_STATE_COMMAND  InpStateCommand         = STATE_KEEP;
@@ -54,13 +68,15 @@ input int                 InpEndTrade             = 24;
 input double              InpMaxSpreadPoints       = 60.0;
 
 //--- =================== INPUTS: ATR & DISTANCES ====================
+// NOTE: every distance below is a MULTIPLE of ATR(InpATRPeriod), not pips.
+//        Final price distance = multiplier * ATR. ATR-adaptive by design.
 input int                 InpATRPeriod            = 14;
-input double              InpDistance             = 1.00;
-input double              InpTP                   = 0.75;
-input double              InpIndivTP              = 0.00;
-input double              InpBasketSL_Pips        = 4.00;
-input double              InpSL                   = 0.00;
-input double              InpHardSLPips           = 6.00;
+input double              InpDistance             = 1.00;    // grid spacing = X * ATR against newest order
+input double              InpTP                   = 0.75;    // basket take-profit = X * ATR from avg price
+input double              InpIndivTP              = 0.00;    // per-order TP = X * ATR (0 = off)
+input double              InpBasketSL_ATR         = 4.00;    // basket SL distance as ATR MULTIPLE (not pips)
+input double              InpSL                   = 0.00;    // per-order soft SL = X * ATR (0 = off)
+input double              InpHardSL_ATR           = 6.00;    // per-order broker hard SL as ATR MULTIPLE (not pips)
 
 //--- =================== INPUTS: LOTS & GRID (tamed) ====================
 input ENUM_LOT_MODE       InpDbLots               = LOT_MULTIPLIER;
@@ -73,11 +89,11 @@ input double              InpMaxRecoveryLot        = 0.10;
 input bool                InpHaltAddonsWhenCapped = true;
 
 //--- =================== INPUTS: HEDGE GRID ====================
-input bool                InpHedgeMode            = true;    // NEW: alternating hedge grid
-input bool                InpAllowBothDirections  = true;    // NEW: BUY and SELL baskets can coexist
-input bool                InpUseHedgeOffset       = true;    // NEW: harvest winner to reduce DD
-input double              InpHedgeOffsetMinProfit = 5.0;     // $ on winning side
-input double              InpHedgeOffsetMaxLoss   = 20.0;    // $ on losing side (abs)
+input bool                InpHedgeMode            = true;    // alternating hedge grid (pendulum). REQUIRES a HEDGING (non-netting) account: on a netting server simultaneous BUY+SELL net to zero and the EA malfunctions silently.
+input bool                InpAllowBothDirections  = true;    // BUY and SELL baskets can coexist
+input bool                InpUseHedgeOffset       = true;    // harvest winner to reduce DD
+input double              InpHedgeOffsetMinProfit = 5.0;     // $ on winning side (fixed $; scale to account size)
+input double              InpHedgeOffsetMaxLoss   = 20.0;    // $ on losing side (abs, fixed $; scale to account size)
 input int                 InpHedgeOffsetCooldown  = 60;      // seconds between harvests
 
 //--- =================== INPUTS: TRAILING STOP ====================
@@ -92,12 +108,12 @@ input bool                InpUseBasketSL          = true;
 input int                 InpMinModifyPoints      = 10;
 
 //--- =================== INPUTS: RISK ====================
-input ENUM_DD_MODE        InpDDMode               = DD_EA_FLOATING;
+input ENUM_DD_MODE        InpDDMode               = DD_EA_FLOATING;  // DD_EA_FLOATING measures only THIS EA's floating P/L vs balance (not whole-account equity). On shared accounts the real account DD can exceed this cap.
 input double              InpMaxDrawdownPct       = 20.0;
 input double              InpMaxSessionDDPct      = 8.0;
 input bool                InpCloseAllOnDDStop     = true;
-input ENUM_EQUITY_RESET   InpDDResetMode          = EQRESET_COOLDOWN;  // FIX default
-input int                 InpDDCooldownMin        = 60;                // FIX default
+input ENUM_EQUITY_RESET   InpDDResetMode          = EQRESET_COOLDOWN;  // after a DD breach, how the latch clears
+input int                 InpDDCooldownMin        = 60;                // minutes; with EQRESET_COOLDOWN, latch auto-releases after this many minutes. WARNING: value <= 0 makes the latch PERMANENT until manual STATE_RESET_DD_LATCH.
 input double              InpMinMarginLevel       = 150.0;
 input double              InpMinEquity            = 0.0;
 input double              InpMaxBasketLossMoney    = 0.0;
@@ -105,9 +121,9 @@ input double              InpMaxBasketLossMoney    = 0.0;
 //--- =================== INPUTS: ENTRY FILTERS ====================
 input bool                InpUseTrendFilter       = true;
 input bool                InpTrendFilterAddons    = true;
-input int                 InpTrendMA_Period       = 50;      // FIX: was 9 in .set
+input int                 InpTrendMA_Period       = 50;      // H1 EMA(50) = real trend gate; MA(9) on M5 is permissive noise
 input ENUM_MA_METHOD      InpTrendMA_Method       = MODE_EMA;
-input ENUM_TIMEFRAMES     InpTrendTimeframe       = PERIOD_H1;// FIX: was M5 in .set
+input ENUM_TIMEFRAMES     InpTrendTimeframe       = PERIOD_H1;// H1 default; setting M5 re-enables a noisy permissive filter
 input bool                InpUseADXFilter         = false;
 input int                 InpADXPeriod            = 14;
 input double              InpADXThreshold         = 22.0;
@@ -115,7 +131,7 @@ input bool                InpADXUseDI             = true;
 
 //--- =================== INPUTS: UI ====================
 input bool                InpUseDashboard         = true;
-input bool                InpJournalEnabled      = true;     // FIX: was false in .set
+input bool                InpJournalEnabled      = true;
 input string              InpJournalFile          = "HOKKY_trades.csv";
 
 //--- =================== CONSTANTS ====================
@@ -236,7 +252,7 @@ int OnInit()
    UpdateHeartbeat();
    if(InpUseDashboard)
       UpdateDashboard();
-   Print("HOKKY V5.00 HEDGE init. Magic=", g_magic, " HedgeMode=", InpHedgeMode, " Trail=", InpUseTrailingStop);
+   Print("HOKKY V5.01 HEDGE init. Magic=", g_magic, " HedgeMode=", InpHedgeMode, " Trail=", InpUseTrailingStop);
    return(INIT_SUCCEEDED);
   }
 
@@ -383,7 +399,7 @@ bool ValidateInputs()
   {
    if(InpMagicNumber < 0 || InpATRPeriod < 1 || InpDistance <= 0.0)
       return InitError("Invalid ATR/Magic");
-   if(InpTP < 0.0 || InpIndivTP < 0.0 || InpBasketSL_Pips < 0.0 || InpSL < 0.0 || InpHardSLPips < 0.0)
+   if(InpTP < 0.0 || InpIndivTP < 0.0 || InpBasketSL_ATR < 0.0 || InpSL < 0.0 || InpHardSL_ATR < 0.0)
       return InitError("ATR distance < 0");
    if(InpLots <= 0.0 || InpMultiplier < 1.0 || InpMaxLevel < 1)
       return InitError("Lot/Grid invalid");
@@ -393,8 +409,8 @@ bool ValidateInputs()
       return InitError("InpEndTrade must be 0..24");
    if(InpLeaseStaleSeconds < 5)
       return InitError("InpLeaseStaleSeconds must be >= 5");
-   if(InpRequireBrokerSL && InpHardSLPips <= 0.0)
-      return InitError("InpRequireBrokerSL requires InpHardSLPips > 0");
+   if(InpRequireBrokerSL && InpHardSL_ATR <= 0.0)
+      return InitError("InpRequireBrokerSL requires InpHardSL_ATR > 0");
    if(InpUseBasketTP && InpTP <= 0.0)
       return InitError("InpTP must be > 0 when basket TP is enabled");
    if(InpUseTrailingStop && InpTrailDistanceATR <= 0.0)
@@ -403,9 +419,15 @@ bool ValidateInputs()
       return InitError("TrailStartATR must be >= TrailDistanceATR");
    if(NormalizeLotDown(InpLots) <= 0.0)
       return InitError("InpLots below broker minimum");
+// Informational (not fatal): COOLDOWN mode with zero cooldown = permanent latch.
+   if(InpDDResetMode == EQRESET_COOLDOWN && InpDDCooldownMin <= 0)
+      Print("HOKKY V5: DDCooldownMin<=0 with COOLDOWN mode => DD latch is PERMANENT until manual STATE_RESET_DD_LATCH.");
+// Informational: hedge mode needs a hedging account.
+   if(InpHedgeMode)
+      Print("HOKKY V5: HedgeMode is ON. Ensure the account is a HEDGING (non-netting) account.");
 
-   bool hasExit = ((InpUseBasketTP && InpTP > 0.0) || (InpUseBasketSL && InpBasketSL_Pips > 0.0) ||
-                   (InpIndivTP > 0.0) || (InpSL > 0.0) || (InpHardSLPips > 0.0) ||
+   bool hasExit = ((InpUseBasketTP && InpTP > 0.0) || (InpUseBasketSL && InpBasketSL_ATR > 0.0) ||
+                   (InpIndivTP > 0.0) || (InpSL > 0.0) || (InpHardSL_ATR > 0.0) ||
                    (InpUseTrailingStop) ||
                    (InpMaxDrawdownPct > 0.0) || (InpMaxSessionDDPct > 0.0) ||
                    (InpMinEquity > 0.0) || (InpMaxBasketLossMoney > 0.0) || (InpMinMarginLevel > 0.0));
@@ -1185,7 +1207,7 @@ bool ManageLogicalExits()
       return(false);
 
 // Basket TP/SL - per direction
-   double basketTP = ATRDistance(InpTP), basketSL = ATRDistance(InpBasketSL_Pips);
+   double basketTP = ATRDistance(InpTP), basketSL = ATRDistance(InpBasketSL_ATR);
    if(g_buyCount > 0)
      {
       if(InpUseBasketTP && basketTP > 0.0 && Bid >= g_buyAvg + basketTP)
@@ -1202,7 +1224,7 @@ bool ManageLogicalExits()
      }
 
    bool acted = false;
-   double softSL = ATRDistance(InpSL), indivTP = ATRDistance(InpIndivTP), hardSL = ATRDistance(InpHardSLPips);
+   double softSL = ATRDistance(InpSL), indivTP = ATRDistance(InpIndivTP), hardSL = ATRDistance(InpHardSL_ATR);
 
 // Individual soft/hard SL and individual TP
    for(int i = 0; i < g_buyCount; i++)
@@ -1280,14 +1302,12 @@ void TrailOneSell(const COrderData &ord, double startDist, double trailDist, dou
       return;
    double newSL = NormalizePrice(Ask + trailDist);
    if(newSL <= 0.0 || newSL >= ord.openPrice)
+      return; // never trail above entry (would lock a loss for SELL)
+// First placement: no existing SL -> set it. Otherwise only move SL down
+// (lower price is better for SELL) and require at least stepPrice improvement.
+// This mirrors TrailOneBuy; the previous double-tested gate was a dead branch.
+   if(ord.currentSL > 0.0 && (ord.currentSL - newSL) < stepPrice)
       return;
-   if(ord.currentSL - newSL < stepPrice && ord.currentSL > 0.0)
-      return;
-   if(ord.currentSL <= 0.0 && newSL > 0.0)
-     { /* first set, allow */ }
-   else
-      if(ord.currentSL - newSL < stepPrice)
-         return;
    if(SafeOrderModify(ord.ticket, newSL, ord.currentTP))
       LogTrade("TRAIL", ord.ticket, ord.lots, Ask, newSL, ord.currentTP, "sell trail");
   }
@@ -1403,9 +1423,9 @@ void ReconcileBrokerProtection()
 bool ReconcileOne(const COrderData &ord)
   {
    double sl = 0.0, tp = 0.0;
-   if(InpHardSLPips > 0.0)
-      sl = (ord.type == OP_BUY) ? (ord.openPrice - ATRDistance(InpHardSLPips))
-           : (ord.openPrice + ATRDistance(InpHardSLPips));
+   if(InpHardSL_ATR > 0.0)
+      sl = (ord.type == OP_BUY) ? (ord.openPrice - ATRDistance(InpHardSL_ATR))
+           : (ord.openPrice + ATRDistance(InpHardSL_ATR));
    if(InpIndivTP > 0.0)
       tp = (ord.type == OP_BUY) ? (ord.openPrice + ATRDistance(InpIndivTP))
            : (ord.openPrice - ATRDistance(InpIndivTP));
@@ -1504,9 +1524,9 @@ int SafeOrderSend(int cmd, double lot, string comment)
       return(-1);
    RefreshRates();
    double entry = (cmd == OP_BUY) ? Ask : Bid, sl = 0.0, tp = 0.0;
-   if(InpHardSLPips > 0.0)
-      sl = (cmd == OP_BUY) ? (entry - ATRDistance(InpHardSLPips))
-           : (entry + ATRDistance(InpHardSLPips));
+   if(InpHardSL_ATR > 0.0)
+      sl = (cmd == OP_BUY) ? (entry - ATRDistance(InpHardSL_ATR))
+           : (entry + ATRDistance(InpHardSL_ATR));
    if(InpIndivTP > 0.0)
       tp = (cmd == OP_BUY) ? (entry + ATRDistance(InpIndivTP))
            : (entry - ATRDistance(InpIndivTP));
@@ -1952,7 +1972,7 @@ void UpdateDashboard()
                      (g_state == EA_CLOSE_ALL_PENDING ? clrOrange : clrRed));
    double marginLevel = (AccountMargin() > 0.0) ? AccountEquity() / AccountMargin() * 100.0 : 0.0;
 
-   SetLabel("00", x, y + dy*line++, "HOKKY V5.00 HEDGE | Magic " + IntegerToString(g_magic) +
+   SetLabel("00", x, y + dy*line++, "HOKKY V5.01 HEDGE | Magic " + IntegerToString(g_magic) +
             " | " + Symbol() + " M" + IntegerToString(Period()) +
             " | Hedge=" + (InpHedgeMode ? "ON" : "OFF"), clrWhite, 9);
    SetLabel("01", x, y + dy*line++, "State: " + StateText(g_state) + " - " + g_stateReason, stateClr, 9);
