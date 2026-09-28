@@ -1,34 +1,34 @@
 //+------------------------------------------------------------------+
 //|                                        EA_HOKKY_V5_HEDGE.mq4     |
-//| HOKKY V5.01 - Hedged Grid + Trailing Stops + DD Reduction         |
-//| Single-file, hardened, MQL4 best-practice rebuild.                |
+//| HOKKY V5.01 - Hedged Grid + Trailing Stops + DD Reduction        |
+//| Single-file, hardened, MQL4 best-practice rebuild.               |
 //|                                                                  |
-//| NEW vs V4.30:                                                     |
-//|   - Hedge grid: L1,L2,... alternate direction (pendulum grid)     |
-//|   - Trailing stop service (per order, ATR-based)                  |
-//|   - Hedge offset DD reduction (harvest winning side)              |
-//|   - Absolute loss guards (equity floor, basket money stop)        |
-//|   - Both directions work independently and simultaneously         |
+//| NEW vs V4.30:                                                    |
+//|   - Hedge grid: L1,L2,... alternate direction (pendulum grid)    |
+//|   - Trailing stop service (per order, ATR-based)                 |
+//|   - Hedge offset DD reduction (harvest winning side)             |
+//|   - Absolute loss guards (equity floor, basket money stop)       |
+//|   - Both directions work independently and simultaneously        |
 //|                                                                  |
-//| FIXES:                                                            |
-//|   - MaxLevel=8, Multiplier=1.30, UseBasketSL=true, Journal=true   |
-//|   - Trend filter on H1, MA(50) defaults                           |
-//|   - Non-blocking close-all FSM (no Sleep in tick)                 |
-//|   - Persistent schema guard, instance lease, protection fault     |
+//| FIXES:                                                           |
+//|   - MaxLevel=8, Multiplier=1.30, UseBasketSL=true, Journal=true  |
+//|   - Trend filter on H1, MA(50) defaults                          |
+//|   - Non-blocking close-all FSM (no Sleep in tick)                |
+//|   - Persistent schema guard, instance lease, protection fault    |
 //|                                                                  |
-//| V5.01 CLEANUP (XAUUSD M1 hardening):                              |
-//|   - Renamed misleading *_Pips inputs: these are ATR multipliers,  |
-//|     not pips. InpBasketSL_Pips -> InpBasketSL_ATR,                |
-//|     InpHardSLPips -> InpHardSL_ATR. (.set keys updated to match.)  |
-//|   - De-duplicated redundant step-check in TrailOneSell (was a     |
-//|     double-tested gate; now mirrors TrailOneBuy).                 |
-//|   - Clarified InpDDResetMode/InpDDCooldownMin: COOLDOWN with      |
-//|     DDCooldownMin<=0 is a PERMANENT latch until manual reset.     |
-//|   - Clarified InpHedgeMode: requires a HEDGING (non-netting)       |
+//| V5.01 CLEANUP (XAUUSD M1 hardening):                             |
+//|   - Renamed misleading *_Pips inputs: these are ATR multipliers, |
+//|     not pips. InpBasketSL_Pips -> InpBasketSL_ATR,               |
+//|     InpHardSLPips -> InpHardSL_ATR. (.set keys updated to match.)|
+//|   - De-duplicated redundant step-check in TrailOneSell (was a    |
+//|     double-tested gate; now mirrors TrailOneBuy).                |
+//|   - Clarified InpDDResetMode/InpDDCooldownMin: COOLDOWN with     |
+//|     DDCooldownMin<=0 is a PERMANENT latch until manual reset.    |
+//|   - Clarified InpHedgeMode: requires a HEDGING (non-netting)     |
 //|     account; on a netting server both legs net out and the grid  |
-//|     malfunctions silently.                                        |
-//|   - Clarified InpSlippage: in points; raise (30-50) for volatile  |
-//|     symbols such as XAUUSD so risk-exit fills succeed in spikes.  |
+//|     malfunctions silently.                                       |
+//|   - Clarified InpSlippage: in points; raise (30-50) for volatile |
+//|     symbols such as XAUUSD so risk-exit fills succeed in spikes. |
 //+------------------------------------------------------------------+
 #property strict
 #property copyright "HOKKY V5 HEDGE"
